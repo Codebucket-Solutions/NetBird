@@ -376,8 +376,12 @@ def sign(args: argparse.Namespace) -> None:
             )
 
         try:
-            print("Installing the temporary verification trust chain", flush=True)
-            for store, path in [("Root", roots[0]), *[("CA", item) for item in intermediates]]:
+            print("Installing temporary verification certificates", flush=True)
+            certificates_to_install = [
+                ("TrustedPeople", leaf_path),
+                *[("CA", item) for item in intermediates],
+            ]
+            for store, path in certificates_to_install:
                 installed.append(install_certificate(certutil, openssl, store, path))
 
             for executable in sorted(executables.values()):
