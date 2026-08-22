@@ -225,7 +225,15 @@ jobs:
 
           (
             cd client/ui
-            wails3 task darwin:package:universal EXTRA_TAGS=enterprise
+            # The upstream universal task starts both native builds concurrently.
+            # Both branches regenerate frontend/dist, so one Go embed can observe
+            # the directory while the other branch is replacing it. Build the
+            # architectures sequentially, then perform the same lipo/package steps.
+            wails3 task darwin:build ARCH=amd64 OUTPUT=bin/netbird-ui-amd64 EXTRA_TAGS=enterprise
+            wails3 task darwin:build ARCH=arm64 OUTPUT=bin/netbird-ui-arm64 EXTRA_TAGS=enterprise
+            lipo -create -output bin/netbird-ui bin/netbird-ui-amd64 bin/netbird-ui-arm64
+            rm bin/netbird-ui-amd64 bin/netbird-ui-arm64
+            wails3 task darwin:create:app:bundle
           )
           cp -R client/ui/bin/netbird-ui.app "$output/"
           cp '${{ runner.temp }}/netbird-source.provenance.json' "$output/provenance.json"
