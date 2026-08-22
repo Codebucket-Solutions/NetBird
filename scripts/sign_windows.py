@@ -149,22 +149,29 @@ def certificate_der(certificate: Path) -> bytes:
 
 
 def install_certificate(
-    certutil: Path, openssl: Path, store_name: str, certificate: Path
-) -> tuple[str, str]:
+    certutil: Path,
+    openssl: Path,
+    store_name: str,
+    certificate: Path,
+    *,
+    current_user: bool,
+) -> tuple[bool, str, str]:
     der_path = certificate.with_suffix(".cer")
     der_path.write_bytes(certificate_der(certificate))
+    scope = ["-user"] if current_user else []
     run(
-        [str(certutil), "-user", "-f", "-addstore", store_name, str(der_path)],
+        [str(certutil), *scope, "-f", "-addstore", store_name, str(der_path)],
         timeout_seconds=CERTUTIL_TIMEOUT_SECONDS,
     )
-    return store_name, certificate_thumbprint(openssl, certificate)
+    return current_user, store_name, certificate_thumbprint(openssl, certificate)
 
 
-def remove_certificates(certutil: Path, installed: list[tuple[str, str]]) -> None:
-    for store_name, thumbprint in reversed(installed):
+def remove_certificates(certutil: Path, installed: list[tuple[bool, str, str]]) -> None:
+    for current_user, store_name, thumbprint in reversed(installed):
+        scope = ["-user"] if current_user else []
         try:
             run(
-                [str(certutil), "-user", "-delstore", store_name, thumbprint],
+                [str(certutil), *scope, "-delstore", store_name, thumbprint],
                 timeout_seconds=CERTUTIL_TIMEOUT_SECONDS,
             )
         except RuntimeError as error:
@@ -305,7 +312,7 @@ def sign(args: argparse.Namespace) -> None:
     openssl = find_openssl()
     signtool = find_signtool()
     certutil = find_certutil()
-    installed: list[tuple[str, str]] = []
+    installed: list[tuple[bool, str, str]] = []
     with tempfile.TemporaryDirectory(prefix="netbird-authenticode-") as temporary:
         temporary_path = Path(temporary)
         key_path = temporary_path / "key.pem"
@@ -376,13 +383,17 @@ def sign(args: argparse.Namespace) -> None:
             )
 
         try:
-            print("Installing temporary verification certificates", flush=True)
+            print("Installing the temporary machine verification chain", flush=True)
             certificates_to_install = [
-                ("TrustedPeople", leaf_path),
+                ("Root", roots[0]),
                 *[("CA", item) for item in intermediates],
             ]
             for store, path in certificates_to_install:
-                installed.append(install_certificate(certutil, openssl, store, path))
+                installed.append(
+                    install_certificate(
+                        certutil, openssl, store, path, current_user=False
+                    )
+                )
 
             for executable in sorted(executables.values()):
                 sign_executable(signtool, pfx_path, pfx_password, executable)
