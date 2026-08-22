@@ -773,7 +773,7 @@ index 0000000000000000000000000000000000000000..6e3fab1b561bf55f5fc63927c35263d3
 +	if s.policy == nil {
 +		return modeRequired
 +	}
-+	return s.policy.mode(time.Now())
++	return s.policy.mode(s.policy.now())
 +}
 +
 +func (s *wrappedServer) Login(ctx context.Context, request *proto.LoginRequest) (*proto.LoginResponse, error) {
@@ -893,4 +893,3 @@ index 0000000000000000000000000000000000000000..6e3fab1b561bf55f5fc63927c35263d3
 +}
 -- 
 2.55.0.windows.4
-

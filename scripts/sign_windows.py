@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
 import hashlib
 import os
 import re
@@ -21,6 +23,9 @@ CERTIFICATE_PATTERN = re.compile(
 EXPECTED_EXECUTABLES = {"netbird.exe", "netbird-ui.exe"}
 EXPECTED_COMMON_NAME = "netbird.internal.codebuckets.in"
 TIMESTAMP_URL = "http://timestamp.digicert.com"
+X509_ASN_ENCODING = 0x00000001
+PKCS_7_ASN_ENCODING = 0x00010000
+CERT_STORE_ADD_REPLACE_EXISTING = 3
 
 
 def run(
@@ -118,6 +123,63 @@ def certificate_thumbprint(openssl: Path, certificate: Path) -> str:
     return value.replace(":", "").strip().upper()
 
 
+def certificate_der(certificate: Path) -> bytes:
+    value = certificate.read_text(encoding="ascii")
+    body = re.sub(r"-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\s", "", value)
+    return base64.b64decode(body, validate=True)
+
+
+def install_certificate(store_name: str, certificate: Path) -> tuple[int, int]:
+    from ctypes import wintypes
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    crypt32.CertOpenSystemStoreW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR]
+    crypt32.CertOpenSystemStoreW.restype = wintypes.HANDLE
+    crypt32.CertAddEncodedCertificateToStore.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_ubyte),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    crypt32.CertAddEncodedCertificateToStore.restype = wintypes.BOOL
+    crypt32.CertCloseStore.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    crypt32.CertCloseStore.restype = wintypes.BOOL
+
+    store = crypt32.CertOpenSystemStoreW(None, store_name)
+    if not store:
+        raise ctypes.WinError(ctypes.get_last_error())
+    encoded = certificate_der(certificate)
+    buffer = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
+    context = ctypes.c_void_p()
+    if not crypt32.CertAddEncodedCertificateToStore(
+        store,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        buffer,
+        len(encoded),
+        CERT_STORE_ADD_REPLACE_EXISTING,
+        ctypes.byref(context),
+    ):
+        error = ctypes.get_last_error()
+        crypt32.CertCloseStore(store, 0)
+        raise ctypes.WinError(error)
+    return int(store), int(context.value)
+
+
+def remove_certificates(installed: list[tuple[int, int]]) -> None:
+    from ctypes import wintypes
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    crypt32.CertDeleteCertificateFromStore.argtypes = [ctypes.c_void_p]
+    crypt32.CertDeleteCertificateFromStore.restype = wintypes.BOOL
+    crypt32.CertCloseStore.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    crypt32.CertCloseStore.restype = wintypes.BOOL
+    for store, context in reversed(installed):
+        crypt32.CertDeleteCertificateFromStore(ctypes.c_void_p(context))
+        crypt32.CertCloseStore(wintypes.HANDLE(store), 0)
+
+
 def validate_signing_identity(
     openssl: Path,
     key_path: Path,
@@ -211,11 +273,7 @@ def sign(args: argparse.Namespace) -> None:
 
     openssl = find_openssl()
     signtool = find_signtool()
-    certutil = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "certutil.exe"
-    if not certutil.is_file():
-        raise RuntimeError("certutil.exe was not found")
-
-    installed: list[tuple[str, str]] = []
+    installed: list[tuple[int, int]] = []
     with tempfile.TemporaryDirectory(prefix="netbird-authenticode-") as temporary:
         temporary_path = Path(temporary)
         key_path = temporary_path / "key.pem"
@@ -283,8 +341,7 @@ def sign(args: argparse.Namespace) -> None:
 
         try:
             for store, path in [("Root", roots[0]), *[("CA", item) for item in intermediates]]:
-                run([str(certutil), "-user", "-addstore", "-f", store, str(path)])
-                installed.append((store, certificate_thumbprint(openssl, path)))
+                installed.append(install_certificate(store, path))
 
             for executable in executables.values():
                 run(
@@ -314,10 +371,7 @@ def sign(args: argparse.Namespace) -> None:
                 f"{digest}  {signed_archive.name}\n", encoding="ascii", newline="\n"
             )
         finally:
-            for store, thumbprint in reversed(installed):
-                run(
-                    [str(certutil), "-user", "-delstore", store, thumbprint], check=False
-                )
+            remove_certificates(installed)
 
     print(f"Signed and verified {len(EXPECTED_EXECUTABLES)} executables")
     print(f"Signing certificate SHA-1: {leaf_thumbprint}")

@@ -417,7 +417,7 @@ def release_preflight(args: argparse.Namespace, overlay_root: Path) -> None:
     config = read_json(overlay_root / "overlay.config.json")
     lock = read_json(overlay_root / "upstream.lock.json")
     require_schema(lock, config)
-    if not config.get("release_enabled"):
+    if not config.get("release_enabled") and not args.allow_release_disabled:
         raise RuntimeError("production release is disabled in overlay.config.json")
     if not config.get("require_enterprise_hook"):
         raise RuntimeError("production release requires require_enterprise_hook=true")
@@ -462,6 +462,11 @@ def parser() -> argparse.ArgumentParser:
 
     release_parser = commands.add_parser("release-preflight", help="enforce protected release gates")
     release_parser.add_argument("--enterprise-revision", required=True)
+    release_parser.add_argument(
+        "--allow-release-disabled",
+        action="store_true",
+        help="validate signing in CI without allowing release publication",
+    )
     release_parser.set_defaults(handler=release_preflight)
     return root
 

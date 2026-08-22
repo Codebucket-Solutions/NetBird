@@ -7,6 +7,11 @@ on:
         description: Enterprise revision from overlay.config.json
         required: true
         type: string
+      signing_test_only:
+        description: Exercise signing without creating a release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,7 +43,10 @@ jobs:
         id: gate
         env:
           REQUESTED_REVISION: ${{ inputs.enterprise_revision }}
-        run: python scripts/overlay.py release-preflight --enterprise-revision "$REQUESTED_REVISION"
+        run: >-
+          python scripts/overlay.py release-preflight
+          --enterprise-revision "$REQUESTED_REVISION"
+          ${{ inputs.signing_test_only && '--allow-release-disabled' || '' }}
 
   qualify:
     name: Rebuild protected candidates
@@ -98,6 +106,7 @@ jobs:
 
   draft-release:
     name: Publish signed-Windows draft
+    if: ${{ inputs.signing_test_only == false }}
     needs:
       - preflight
       - qualify
