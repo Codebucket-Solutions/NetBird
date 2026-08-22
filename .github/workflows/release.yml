@@ -1,0 +1,128 @@
+name: Create enterprise draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      enterprise_revision:
+        description: Enterprise revision from overlay.config.json
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enterprise-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate protected release gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.gate.outputs.release_tag }}
+      upstream_tag: ${{ steps.gate.outputs.upstream_tag }}
+    steps:
+      - name: Check out enterprise overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Enforce release configuration
+        id: gate
+        env:
+          REQUESTED_REVISION: ${{ inputs.enterprise_revision }}
+        run: python scripts/overlay.py release-preflight --enterprise-revision "$REQUESTED_REVISION"
+
+  qualify:
+    name: Rebuild protected candidates
+    needs: preflight
+    uses: ./.github/workflows/qualify.yml
+    with:
+      require_enterprise_hook: true
+    permissions:
+      contents: read
+
+  draft-release:
+    name: Publish unsigned draft for signing
+    needs:
+      - preflight
+      - qualify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out enterprise overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Download qualified candidates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: candidate-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Reconstruct and archive auditable source
+        run: |
+          python scripts/overlay.py materialize \
+            --destination '${{ runner.temp }}/netbird-source' \
+            --require-enterprise-hook
+          git -C '${{ runner.temp }}/netbird-source' archive \
+            --format=tar.gz \
+            --prefix='netbird-enterprise-source/' \
+            --output="$PWD/release-assets/netbird-enterprise-source.tar.gz" \
+            HEAD
+          cp '${{ runner.temp }}/netbird-source.provenance.json' './release-assets/source-provenance.json'
+
+      - name: Create aggregate checksums
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sed 's#  \./#  #' > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create immutable draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.preflight.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-enterprise\.[1-9][0-9]*$ ]]
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists and will not be overwritten: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          {
+            echo "Enterprise client candidate based on upstream ${UPSTREAM_TAG}."
+            echo
+            echo 'This release is deliberately a draft. Windows Authenticode signing and macOS Developer ID signing/notarization must complete before promotion.'
+          } > "$notes_file"
+
+          gh release create "$RELEASE_TAG" \
+            release-assets/* \
+            --draft \
+            --title "$RELEASE_TAG" \
+            --notes-file "$notes_file"

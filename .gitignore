@@ -1,0 +1,12 @@
+/build/
+/netbird/
+/.tmp/
+__pycache__/
+*.pyc
+*.p12
+*.pfx
+*.cer
+*.key
+*.mobileprovision
+*.provisionprofile
+*.provenance.json

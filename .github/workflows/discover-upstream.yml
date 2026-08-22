@@ -1,0 +1,86 @@
+name: Discover stable upstream release
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: discover-stable-upstream
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out enterprise overlay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Resolve and pin latest stable upstream release
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/overlay.py discover --write-lock
+
+      - name: Open draft qualification pull request
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.release_tag }}
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.commit_sha }}
+          UPSTREAM_RELEASE_URL: ${{ steps.upstream.outputs.release_url }}
+        run: |
+          set -euo pipefail
+          [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$UPSTREAM_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+
+          branch="automation/upstream-${UPSTREAM_TAG}"
+          git switch -c "$branch"
+          git add -- upstream.lock.json
+          git diff --cached --exit-code && {
+            echo "Resolver reported a change but produced no lock diff" >&2
+            exit 1
+          }
+          git -c user.name='codebuckets-upstream-bot' \
+              -c user.email='netbird-overlay@codebuckets.in' \
+              commit -m "chore(upstream): qualify ${UPSTREAM_TAG}"
+          git push --force-with-lease origin "HEAD:refs/heads/${branch}"
+
+          existing_url="$(gh pr list --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [[ -n "$existing_url" ]]; then
+            echo "Qualification PR already exists: $existing_url"
+            exit 0
+          fi
+
+          body_file="$(mktemp)"
+          trap 'rm -f "$body_file"' EXIT
+          {
+            echo 'Automated discovery found a newer stable NetBird release.'
+            echo
+            echo "- Upstream tag: \`${UPSTREAM_TAG}\`"
+            echo "- Peeled commit: \`${UPSTREAM_COMMIT}\`"
+            echo "- Release: ${UPSTREAM_RELEASE_URL}"
+            echo
+            echo 'This PR is intentionally draft. Qualification must apply the enterprise patch stack, pass invariant tests, and build Windows and macOS candidates before merge.'
+          } > "$body_file"
+
+          gh pr create \
+            --draft \
+            --base main \
+            --head "$branch" \
+            --title "chore(upstream): qualify ${UPSTREAM_TAG}" \
+            --body-file "$body_file"
