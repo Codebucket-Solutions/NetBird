@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,16 +22,24 @@ from typing import Any
 STABLE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 PATCH_HASH = re.compile(r"^([0-9a-fA-F]{64})  (.+)$")
+PATCH_DIFF = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
+ENTERPRISE_HOOK_PATH = "client/cmd/service_controller.go"
+CUSTOM_SOURCE_PREFIX = ("client", "enterprise")
 
 
 def run(
     *command: str,
     cwd: Path | None = None,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    if env:
+        environment.update(env)
     result = subprocess.run(
         command,
         cwd=cwd,
+        env=environment,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -212,9 +221,7 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
         for path in run("git", "diff", "--name-only", f"{base}..HEAD", cwd=source).stdout.splitlines()
         if path.strip()
     ]
-    allowed_patterns = [str(pattern) for pattern in config["allowed_upstream_path_patterns"]]
-    if config.get("allow_ui_patch"):
-        allowed_patterns.append("client/ui/**")
+    allowed_patterns = allowed_source_patterns(config)
     unexpected = [
         path
         for path in changed_paths
@@ -288,10 +295,68 @@ def verify_patch_stack(patch_dir: Path) -> list[str]:
     if sorted(manifest) != sorted(entries):
         raise RuntimeError("patch manifest entries do not exactly match patches/series")
     for name in entries:
-        actual = hashlib.sha256((patch_dir / name).read_bytes()).hexdigest()
+        content = (patch_dir / name).read_bytes()
+        actual = hashlib.sha256(content).hexdigest()
         if actual != manifest[name]:
             raise RuntimeError(f"patch hash mismatch: {name}")
+        diff_paths = PATCH_DIFF.findall(content.decode("utf-8"))
+        if not diff_paths:
+            raise RuntimeError(f"patch contains no file diff: {name}")
+        for before, after in diff_paths:
+            if before != ENTERPRISE_HOOK_PATH or after != ENTERPRISE_HOOK_PATH:
+                raise RuntimeError(
+                    f"patch modifies a path other than the enterprise hook: {name}: {before} -> {after}"
+                )
     return entries
+
+
+def allowed_source_patterns(config: dict[str, Any]) -> list[str]:
+    patterns = [str(pattern) for pattern in config["allowed_upstream_path_patterns"]]
+    if config.get("allow_ui_patch"):
+        patterns.append("client/ui/**")
+    return patterns
+
+
+def custom_source_inventory(
+    custom_root: Path,
+    allowed_patterns: list[str],
+) -> tuple[list[tuple[Path, Path]], str]:
+    if not custom_root.is_dir():
+        raise RuntimeError(f"custom source root does not exist: {custom_root}")
+    inventory: list[tuple[Path, Path]] = []
+    digest = hashlib.sha256()
+    for source in sorted(custom_root.rglob("*")):
+        if source.is_symlink():
+            raise RuntimeError(f"custom source must not contain symlinks: {source}")
+        if not source.is_file():
+            continue
+        relative = source.relative_to(custom_root)
+        normalized = relative.as_posix()
+        if relative.parts[: len(CUSTOM_SOURCE_PREFIX)] != CUSTOM_SOURCE_PREFIX:
+            raise RuntimeError(f"custom source must live under client/enterprise: {normalized}")
+        if not any(fnmatch.fnmatchcase(normalized, pattern) for pattern in allowed_patterns):
+            raise RuntimeError(f"custom source path is outside the allow-list: {normalized}")
+        content = source.read_bytes()
+        digest.update(normalized.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+        inventory.append((source, relative))
+    if not inventory:
+        raise RuntimeError("custom source root is empty")
+    return inventory, digest.hexdigest()
+
+
+def install_custom_sources(
+    destination: Path,
+    inventory: list[tuple[Path, Path]],
+) -> None:
+    for source, relative in inventory:
+        target = destination / relative
+        if target.exists():
+            raise RuntimeError(f"custom source collides with upstream: {relative.as_posix()}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
 
 def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
@@ -309,6 +374,10 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
     if not lock.get("commit_verified"):
         raise RuntimeError("locked upstream commit is not marked verified")
     patch_entries = verify_patch_stack(overlay_root / "patches")
+    custom_inventory, custom_source_sha256 = custom_source_inventory(
+        overlay_root / "custom",
+        allowed_source_patterns(config),
+    )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.mkdir()
@@ -330,10 +399,25 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
 
     for patch_name in patch_entries:
         patch_path = (overlay_root / "patches" / patch_name).resolve()
-        result = run("git", "am", "--3way", "--keep-cr", "--", str(patch_path), cwd=destination, check=False)
+        result = run("git", "apply", "--3way", "--", str(patch_path), cwd=destination, check=False)
         if result.returncode != 0:
-            run("git", "am", "--abort", cwd=destination, check=False)
             raise RuntimeError(f"patch failed: {patch_name}\n{result.stdout}\n{result.stderr}")
+
+    install_custom_sources(destination, custom_inventory)
+    run("git", "add", "--all", cwd=destination)
+    run("git", "diff", "--cached", "--check", cwd=destination)
+    if not run("git", "diff", "--cached", "--name-only", cwd=destination).stdout.strip():
+        raise RuntimeError("enterprise overlay produced no source changes")
+    commit_date = str(lock["release_published_at"])
+    run(
+        "git",
+        "commit",
+        "--no-gpg-sign",
+        "-m",
+        "enterprise: apply CodeBuckets managed client overlay",
+        cwd=destination,
+        env={"GIT_AUTHOR_DATE": commit_date, "GIT_COMMITTER_DATE": commit_date},
+    )
 
     if not args.skip_verification:
         print_result(verify_source(destination, overlay_root, args.require_enterprise_hook))
@@ -348,6 +432,8 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
         "overlay_commit": overlay_head.stdout.strip() if overlay_head.returncode == 0 else "uncommitted",
         "patch_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "patch_count": len(patch_entries),
+        "custom_source_sha256": custom_source_sha256,
+        "custom_file_count": len(custom_inventory),
         "source_head": run("git", "rev-parse", "HEAD", cwd=destination).stdout.strip(),
         "source_tree": run("git", "rev-parse", "HEAD^{tree}", cwd=destination).stdout.strip(),
         "materialized_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -365,7 +451,7 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
     print_result({"source_path": str(destination), "provenance_path": str(provenance_path), **provenance})
 
 
-def export_patches(args: argparse.Namespace, overlay_root: Path) -> None:
+def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
     source = Path(args.source).resolve()
     output = Path(args.output).resolve()
     if not source.is_dir() or output.exists():
@@ -374,39 +460,47 @@ def export_patches(args: argparse.Namespace, overlay_root: Path) -> None:
     run("git", "merge-base", "--is-ancestor", base, "HEAD", cwd=source)
     if run("git", "status", "--porcelain", cwd=source).stdout.strip():
         raise RuntimeError("development source must be clean before exporting patches")
-    if run("git", "rev-list", "--merges", f"{base}..HEAD", cwd=source).stdout.strip():
-        raise RuntimeError("enterprise patch stack must be linear")
-    count = int(run("git", "rev-list", "--count", f"{base}..HEAD", cwd=source).stdout.strip())
-    if count == 0:
-        raise RuntimeError("there are no enterprise commits to export")
+    verify_source(source, overlay_root, True)
 
-    output.mkdir(parents=True)
-    run(
+    custom_source = source / "client" / "enterprise"
+    if not custom_source.is_dir():
+        raise RuntimeError("development source is missing client/enterprise")
+    custom_output = output / "custom" / "client" / "enterprise"
+    custom_output.parent.mkdir(parents=True)
+    shutil.copytree(custom_source, custom_output)
+
+    patch_output = output / "patches"
+    patch_output.mkdir(parents=True)
+    patch_name = "0001-enterprise-enforce-managed-client-policy.patch"
+    hook_diff = run(
         "git",
-        "format-patch",
+        "diff",
         "--binary",
         "--full-index",
-        "--zero-commit",
-        "--no-stat",
-        "--output-directory",
-        str(output),
         f"{base}..HEAD",
+        "--",
+        "client/cmd/service_controller.go",
         cwd=source,
+    ).stdout
+    if not hook_diff.strip():
+        raise RuntimeError("development source has no enterprise hook change")
+    patch_path = patch_output / patch_name
+    patch_path.write_text(hook_diff, encoding="utf-8", newline="\n")
+    (patch_output / "series").write_text(patch_name + "\n", encoding="utf-8", newline="\n")
+    patch_digest = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+    (patch_output / "manifest.sha256").write_text(
+        f"{patch_digest}  {patch_name}\n",
+        encoding="utf-8",
+        newline="\n",
     )
-    patches = sorted(path.name for path in output.glob("*.patch"))
-    if len(patches) != count:
-        raise RuntimeError(f"expected {count} patches but generated {len(patches)}")
-    (output / "series").write_text("\n".join(patches) + "\n", encoding="utf-8", newline="\n")
-    manifest = [f"{hashlib.sha256((output / name).read_bytes()).hexdigest()}  {name}" for name in patches]
-    (output / "manifest.sha256").write_text("\n".join(manifest) + "\n", encoding="utf-8", newline="\n")
     print_result(
         {
             "source_path": str(source),
             "base_commit": base,
             "source_head": run("git", "rev-parse", "HEAD", cwd=source).stdout.strip(),
-            "commit_count": count,
             "output_directory": str(output),
-            "patch_files": patches,
+            "patch_file": patch_name,
+            "custom_file_count": len([path for path in custom_output.rglob("*") if path.is_file()]),
         }
     )
 
@@ -455,10 +549,10 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--require-enterprise-hook", action="store_true")
     verify_parser.set_defaults(handler=verify)
 
-    export_parser = commands.add_parser("export", help="export a linear enterprise commit range")
+    export_parser = commands.add_parser("export", help="export custom sources and the tiny hook patch")
     export_parser.add_argument("--source", required=True)
     export_parser.add_argument("--output", required=True)
-    export_parser.set_defaults(handler=export_patches)
+    export_parser.set_defaults(handler=export_overlay)
 
     release_parser = commands.add_parser("release-preflight", help="enforce protected release gates")
     release_parser.add_argument("--enterprise-revision", required=True)

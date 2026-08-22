@@ -4,11 +4,12 @@ This repository contains the enterprise overlay for the upstream
 [`netbirdio/netbird`](https://github.com/netbirdio/netbird) client. It does not
 vendor the upstream source tree.
 
-Every build is reconstructed from three immutable inputs:
+Every build is reconstructed from four immutable inputs:
 
 1. `upstream.lock.json`, which pins the upstream annotated tag and commit;
 2. the ordered patches listed in `patches/series`; and
-3. the overlay Git commit containing the scripts and workflows.
+3. the enterprise Go sources under `custom/`; and
+4. the overlay Git commit containing the scripts and workflows.
 
 The upstream checkout under the parent workspace (`../netbird-original`) is a
 developer reference only. CI never trusts or packages it. CI creates a fresh
@@ -16,11 +17,12 @@ checkout from the lock and applies the patch series.
 
 ## Current implementation status
 
-The enterprise wrapper is maintained as one patch that changes one upstream
-composition file, `client/cmd/service_controller.go`. All policy logic lives in
-new `client/enterprise` files. Production release remains deliberately disabled
-in `overlay.config.json` until Windows and Apple signing identities exist. This
-prevents accidentally distributing unsigned enterprise clients.
+The only upstream touchpoint is a small patch to
+`client/cmd/service_controller.go`: one import and one `enterprise.Wrap(...)`
+composition hook. Enterprise policy logic is maintained as ordinary Go source
+under `custom/client/enterprise`, outside the patch. Production publication
+remains disabled in `overlay.config.json` until every platform signing gate is
+ready.
 
 ## Local materialization
 
@@ -30,24 +32,26 @@ From Windows, macOS, or Linux:
 python scripts/overlay.py materialize --destination build/source
 ```
 
-The command verifies upstream provenance and the patch manifest, applies every
-patch with `git am --3way`, and runs the overlay invariant checks. It refuses to
-reuse an existing destination.
+The command verifies upstream provenance and the patch manifest, applies the
+tiny hook patch, copies the custom source tree, creates one deterministic overlay
+commit, and runs the invariants. It refuses to reuse an existing destination.
 
 ## Patch development
 
-Develop enterprise changes as linear commits on a temporary checkout based on
-the commit in `upstream.lock.json`, then export them to a new directory:
+Normally, edit `custom/client/enterprise` directly. If developing against a
+materialized checkout, export both the custom source tree and regenerated hook
+patch to a new directory:
 
 ```shell
 python scripts/overlay.py export \
   --source build/development-source \
-  --output build/exported-patches
+  --output build/exported-overlay
 ```
 
-Review the generated patches, `series`, and `manifest.sha256` before replacing
-the canonical `patches/` directory through a pull request. Do not hand-edit the
-derived source and canonical patches independently.
+The export contains `custom/` and `patches/`. Review both before replacing the
+canonical overlay payload. The hook patch must remain limited to
+`client/cmd/service_controller.go`; custom policy code must never be embedded
+inside it.
 
 ## GitHub Actions
 
@@ -56,9 +60,9 @@ derived source and canonical patches independently.
 - `qualify.yml` reconstructs, verifies, tests, and builds Windows and macOS
   candidates from the locked source. Its Ubuntu job is orchestration and Go
   testing only; it does not produce a Linux client.
-- `release.yml` creates a draft release candidate only after the enterprise
-  hook and release gate are enabled. Production signing remains a protected
-  follow-up stage and must not be bypassed.
+- `release.yml` supports a signing-only CI test that cannot publish a release.
+  Normal release dispatches Authenticode-sign Windows candidates and keep the
+  release as a draft until macOS Developer ID signing and notarization finish.
 
 See [`../PLAN.md`](../PLAN.md) for architecture, security, signing, rollout, and
 long-term upgrade requirements.
