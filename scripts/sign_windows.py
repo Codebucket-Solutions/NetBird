@@ -22,7 +22,11 @@ CERTIFICATE_PATTERN = re.compile(
 )
 EXPECTED_EXECUTABLES = {"netbird.exe", "netbird-ui.exe"}
 EXPECTED_COMMON_NAME = "netbird.internal.codebuckets.in"
-TIMESTAMP_URL = "http://timestamp.digicert.com"
+TIMESTAMP_URLS = (
+    "http://timestamp.digicert.com",
+    "http://timestamp.globalsign.com/tsa/r45standard",
+)
+SIGNTOOL_TIMEOUT_SECONDS = 60
 X509_ASN_ENCODING = 0x00000001
 PKCS_7_ASN_ENCODING = 0x00010000
 CERT_STORE_ADD_REPLACE_EXISTING = 3
@@ -34,15 +38,22 @@ def run(
     input_bytes: bytes | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
+    timeout_seconds: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(
-        command,
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"{Path(command[0]).name} exceeded its {timeout_seconds}-second timeout"
+        ) from error
     if check and result.returncode != 0:
         diagnostics = b"\n".join(
             part.strip() for part in (result.stdout, result.stderr) if part.strip()
@@ -251,6 +262,44 @@ def write_archive(source: Path, destination: Path) -> None:
                 archive.write(path, path.relative_to(source).as_posix())
 
 
+def sign_executable(
+    signtool: Path, pfx_path: Path, pfx_password: str, executable: Path
+) -> None:
+    failures: list[str] = []
+    for timestamp_url in TIMESTAMP_URLS:
+        print(f"Signing {executable.name} via {timestamp_url}", flush=True)
+        try:
+            run(
+                [
+                    str(signtool),
+                    "sign",
+                    "/f",
+                    str(pfx_path),
+                    "/p",
+                    pfx_password,
+                    "/fd",
+                    "SHA256",
+                    "/tr",
+                    timestamp_url,
+                    "/td",
+                    "SHA256",
+                    str(executable),
+                ],
+                timeout_seconds=SIGNTOOL_TIMEOUT_SECONDS,
+            )
+            return
+        except RuntimeError as error:
+            failures.append(f"{timestamp_url}: {error}")
+            print(
+                f"Timestamp attempt failed for {timestamp_url}; trying fallback",
+                flush=True,
+            )
+    raise RuntimeError(
+        f"All timestamp services failed while signing {executable.name}\n"
+        + "\n".join(failures)
+    )
+
+
 def sign(args: argparse.Namespace) -> None:
     if os.name != "nt":
         raise RuntimeError("Authenticode signing must run on Windows")
@@ -293,6 +342,10 @@ def sign(args: argparse.Namespace) -> None:
         if len(roots) != 1 or not intermediates:
             raise RuntimeError("CSCA1_CERT does not contain one root and an intermediate chain")
 
+        print(
+            "Validating certificate, key, chain, EKU, and P-384 requirements",
+            flush=True,
+        )
         leaf_thumbprint = validate_signing_identity(
             openssl, key_path, leaf_path, intermediates, roots[0]
         )
@@ -340,28 +393,17 @@ def sign(args: argparse.Namespace) -> None:
             )
 
         try:
+            print("Installing the temporary verification trust chain", flush=True)
             for store, path in [("Root", roots[0]), *[("CA", item) for item in intermediates]]:
                 installed.append(install_certificate(store, path))
 
-            for executable in executables.values():
+            for executable in sorted(executables.values()):
+                sign_executable(signtool, pfx_path, pfx_password, executable)
+                print(f"Verifying {executable.name}", flush=True)
                 run(
-                    [
-                        str(signtool),
-                        "sign",
-                        "/f",
-                        str(pfx_path),
-                        "/p",
-                        pfx_password,
-                        "/fd",
-                        "SHA256",
-                        "/tr",
-                        TIMESTAMP_URL,
-                        "/td",
-                        "SHA256",
-                        str(executable),
-                    ]
+                    [str(signtool), "verify", "/pa", "/all", str(executable)],
+                    timeout_seconds=SIGNTOOL_TIMEOUT_SECONDS,
                 )
-                run([str(signtool), "verify", "/pa", "/all", str(executable)])
 
             signed_archive = output_directory / archives[0].name
             write_archive(expanded, signed_archive)
