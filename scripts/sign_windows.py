@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import ctypes
 import hashlib
 import os
 import re
@@ -27,9 +26,7 @@ TIMESTAMP_URLS = (
     "http://timestamp.globalsign.com/tsa/r45standard",
 )
 SIGNTOOL_TIMEOUT_SECONDS = 60
-X509_ASN_ENCODING = 0x00000001
-PKCS_7_ASN_ENCODING = 0x00010000
-CERT_STORE_ADD_REPLACE_EXISTING = 3
+CERTUTIL_TIMEOUT_SECONDS = 30
 
 
 def run(
@@ -98,6 +95,17 @@ def find_signtool() -> Path:
     return candidates[0]
 
 
+def find_certutil() -> Path:
+    candidate = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "certutil.exe"
+    )
+    if not candidate.is_file():
+        raise RuntimeError("Windows CertUtil was not found")
+    return candidate
+
+
 def openssl_text(openssl: Path, *arguments: str) -> str:
     return run([str(openssl), *arguments]).stdout.decode("utf-8", errors="replace").strip()
 
@@ -140,55 +148,27 @@ def certificate_der(certificate: Path) -> bytes:
     return base64.b64decode(body, validate=True)
 
 
-def install_certificate(store_name: str, certificate: Path) -> tuple[int, int]:
-    from ctypes import wintypes
-
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    crypt32.CertOpenSystemStoreW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR]
-    crypt32.CertOpenSystemStoreW.restype = wintypes.HANDLE
-    crypt32.CertAddEncodedCertificateToStore.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_ubyte),
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    crypt32.CertAddEncodedCertificateToStore.restype = wintypes.BOOL
-    crypt32.CertCloseStore.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    crypt32.CertCloseStore.restype = wintypes.BOOL
-
-    store = crypt32.CertOpenSystemStoreW(None, store_name)
-    if not store:
-        raise ctypes.WinError(ctypes.get_last_error())
-    encoded = certificate_der(certificate)
-    buffer = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
-    context = ctypes.c_void_p()
-    if not crypt32.CertAddEncodedCertificateToStore(
-        store,
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        buffer,
-        len(encoded),
-        CERT_STORE_ADD_REPLACE_EXISTING,
-        ctypes.byref(context),
-    ):
-        error = ctypes.get_last_error()
-        crypt32.CertCloseStore(store, 0)
-        raise ctypes.WinError(error)
-    return int(store), int(context.value)
+def install_certificate(
+    certutil: Path, openssl: Path, store_name: str, certificate: Path
+) -> tuple[str, str]:
+    der_path = certificate.with_suffix(".cer")
+    der_path.write_bytes(certificate_der(certificate))
+    run(
+        [str(certutil), "-user", "-f", "-addstore", store_name, str(der_path)],
+        timeout_seconds=CERTUTIL_TIMEOUT_SECONDS,
+    )
+    return store_name, certificate_thumbprint(openssl, certificate)
 
 
-def remove_certificates(installed: list[tuple[int, int]]) -> None:
-    from ctypes import wintypes
-
-    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
-    crypt32.CertDeleteCertificateFromStore.argtypes = [ctypes.c_void_p]
-    crypt32.CertDeleteCertificateFromStore.restype = wintypes.BOOL
-    crypt32.CertCloseStore.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    crypt32.CertCloseStore.restype = wintypes.BOOL
-    for store, context in reversed(installed):
-        crypt32.CertDeleteCertificateFromStore(ctypes.c_void_p(context))
-        crypt32.CertCloseStore(wintypes.HANDLE(store), 0)
+def remove_certificates(certutil: Path, installed: list[tuple[str, str]]) -> None:
+    for store_name, thumbprint in reversed(installed):
+        try:
+            run(
+                [str(certutil), "-user", "-delstore", store_name, thumbprint],
+                timeout_seconds=CERTUTIL_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as error:
+            print(f"Warning: temporary {store_name} certificate cleanup failed: {error}")
 
 
 def validate_signing_identity(
@@ -316,13 +296,16 @@ def sign(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Expected one Windows candidate archive, found {len(archives)}")
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    certificate_blocks = [match.strip() for match in CERTIFICATE_PATTERN.findall(certificate_bundle)]
+    certificate_blocks = [
+        match.strip() for match in CERTIFICATE_PATTERN.findall(certificate_bundle)
+    ]
     if len(certificate_blocks) < 3:
         raise RuntimeError("CSCA1_CERT must contain leaf, intermediate, and root certificates")
 
     openssl = find_openssl()
     signtool = find_signtool()
-    installed: list[tuple[int, int]] = []
+    certutil = find_certutil()
+    installed: list[tuple[str, str]] = []
     with tempfile.TemporaryDirectory(prefix="netbird-authenticode-") as temporary:
         temporary_path = Path(temporary)
         key_path = temporary_path / "key.pem"
@@ -395,7 +378,7 @@ def sign(args: argparse.Namespace) -> None:
         try:
             print("Installing the temporary verification trust chain", flush=True)
             for store, path in [("Root", roots[0]), *[("CA", item) for item in intermediates]]:
-                installed.append(install_certificate(store, path))
+                installed.append(install_certificate(certutil, openssl, store, path))
 
             for executable in sorted(executables.values()):
                 sign_executable(signtool, pfx_path, pfx_password, executable)
@@ -413,7 +396,7 @@ def sign(args: argparse.Namespace) -> None:
                 f"{digest}  {signed_archive.name}\n", encoding="ascii", newline="\n"
             )
         finally:
-            remove_certificates(installed)
+            remove_certificates(certutil, installed)
 
     print(f"Signed and verified {len(EXPECTED_EXECUTABLES)} executables")
     print(f"Signing certificate SHA-1: {leaf_thumbprint}")
