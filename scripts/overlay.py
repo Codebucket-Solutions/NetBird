@@ -115,7 +115,10 @@ def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: st
         if isinstance(item, dict) and item.get("support") != "enterprise"
     }
     mdm_source = (source / "client" / "mdm" / "policy.go").read_text(encoding="utf-8")
-    native_source_keys = set(re.findall(r'Key[A-Za-z0-9]+\s*=\s*"([^"]+)"', mdm_source))
+    native_source_constants = dict(
+        re.findall(r'(Key[A-Za-z0-9]+)\s*=\s*"([^"]+)"', mdm_source)
+    )
+    native_source_keys = set(native_source_constants.values())
     if native_catalog_keys != native_source_keys:
         missing = sorted(native_source_keys - native_catalog_keys)
         stale = sorted(native_catalog_keys - native_source_keys)
@@ -124,10 +127,34 @@ def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: st
             f"(missing={missing}, stale={stale})"
         )
 
+    registry_match = re.search(
+        r"var supportedNetBirdControls = map\[string\]struct\{\}\{(.*?)\n\}",
+        enterprise_text,
+        re.DOTALL,
+    )
+    if not registry_match:
+        raise RuntimeError("enterprise native-control registry is missing")
+    registry_constants = set(re.findall(r"mdm\.(Key[A-Za-z0-9]+):", registry_match.group(1)))
+    unknown_constants = sorted(registry_constants - set(native_source_constants))
+    if unknown_constants:
+        raise RuntimeError(f"enterprise native-control registry has unknown constants: {unknown_constants}")
+    registry_keys = {native_source_constants[name] for name in registry_constants}
+    schema_control_keys = set(
+        schema.get("properties", {})
+        .get("netBirdControls", {})
+        .get("propertyNames", {})
+        .get("enum", [])
+    )
+    if registry_keys != schema_control_keys:
+        raise RuntimeError(
+            "policy schema and enterprise native-control registry differ "
+            f"(Go={sorted(registry_keys)}, JSON={sorted(schema_control_keys)})"
+        )
+
     required_literals = (
         f"SchemaVersion:         {schema_version}",
         f'enterpriseRevision   = "codebuckets.{config["enterprise_revision"]}"',
-        'json:"controls"',
+        'json:"netBirdControls"',
         'json:"exit_node"',
         'exitNodePinned         exitNodeMode = "PINNED"',
     )

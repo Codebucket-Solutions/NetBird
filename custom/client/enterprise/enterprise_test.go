@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/netbirdio/netbird/client/mdm"
 	"github.com/netbirdio/netbird/client/proto"
 )
 
@@ -92,8 +93,8 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 		if payload["peer_public_key"] != "test-peer-key" {
 			t.Errorf("peer_public_key = %v, want test-peer-key", payload["peer_public_key"])
 		}
-		if payload["schema_version"] != float64(2) {
-			t.Errorf("schema_version = %v, want 2", payload["schema_version"])
+		if payload["schema_version"] != float64(3) {
+			t.Errorf("schema_version = %v, want 3", payload["schema_version"])
 		}
 		if _, ok := payload["exit_node_state"]; !ok {
 			t.Error("request does not contain exit_node_state")
@@ -101,15 +102,15 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 
 		writer.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(writer).Encode(policyResponse{
-			SchemaVersion:  2,
-			Revision:       1,
-			PolicyID:       "test-policy",
-			ConnectionMode: modeAdminDisabled,
-			IssuedAt:       fixedNow.Add(-time.Minute),
-			ValidUntil:     fixedNow.Add(time.Minute),
-			ReasonCode:     "TEST",
-			Controls:       strictControls(),
-			ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
+			SchemaVersion:   3,
+			Revision:        1,
+			PolicyID:        "test-policy",
+			ConnectionMode:  modeAdminDisabled,
+			IssuedAt:        fixedNow.Add(-time.Minute),
+			ValidUntil:      fixedNow.Add(time.Minute),
+			ReasonCode:      "TEST",
+			NetBirdControls: strictNetBirdControls(),
+			ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
 		}); err != nil {
 			t.Fatalf("encode response: %v", err)
 		}
@@ -139,14 +140,14 @@ func TestPolicyIsFailClosedAndRejectsRollback(t *testing.T) {
 	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
 	controller := &policyController{now: func() time.Time { return fixedNow }}
 	valid := policyResponse{
-		SchemaVersion:  2,
-		Revision:       2,
-		PolicyID:       "support-window",
-		ConnectionMode: modeUserControlled,
-		IssuedAt:       fixedNow.Add(-time.Minute),
-		ValidUntil:     fixedNow.Add(time.Minute),
-		Controls:       strictControls(),
-		ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
+		SchemaVersion:   3,
+		Revision:        2,
+		PolicyID:        "support-window",
+		ConnectionMode:  modeUserControlled,
+		IssuedAt:        fixedNow.Add(-time.Minute),
+		ValidUntil:      fixedNow.Add(time.Minute),
+		NetBirdControls: strictNetBirdControls(),
+		ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
 	}
 	if err := controller.accept(valid, fixedNow); err != nil {
 		t.Fatalf("accept valid policy: %v", err)
@@ -199,14 +200,14 @@ func TestWrapperHonorsServerConnectionModes(t *testing.T) {
 		raw: raw,
 		now: func() time.Time { return fixedNow },
 		snapshot: policyResponse{
-			SchemaVersion:  2,
-			Revision:       1,
-			PolicyID:       "connection-policy",
-			ConnectionMode: modeUserControlled,
-			IssuedAt:       fixedNow.Add(-time.Minute),
-			ValidUntil:     fixedNow.Add(time.Minute),
-			Controls:       strictControls(),
-			ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
+			SchemaVersion:   3,
+			Revision:        1,
+			PolicyID:        "connection-policy",
+			ConnectionMode:  modeUserControlled,
+			IssuedAt:        fixedNow.Add(-time.Minute),
+			ValidUntil:      fixedNow.Add(time.Minute),
+			NetBirdControls: strictNetBirdControls(),
+			ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
 		},
 		hasSnapshot: true,
 	}
@@ -228,36 +229,41 @@ func TestWrapperHonorsServerConnectionModes(t *testing.T) {
 	}
 }
 
-func TestPolicyControlsCanBeRelaxedOnlyByValidCurrentPolicy(t *testing.T) {
+func TestNativeControlsCanBeRelaxedOnlyByValidCurrentPolicy(t *testing.T) {
 	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
-	controls := strictControls()
-	controls.Logout = controlEnabled
-	controls.Networks = controlEnabled
+	controls := strictNetBirdControls()
+	controls[mdm.KeyDisableProfiles] = false
+	controls[mdm.KeyDisableNetworks] = false
 	controller := &policyController{
 		now: func() time.Time { return fixedNow },
 		snapshot: policyResponse{
-			ValidUntil: fixedNow.Add(time.Minute),
-			Controls:   controls,
-			ExitNode:   exitNodePolicy{Mode: exitNodeUserControlled},
+			ValidUntil:      fixedNow.Add(time.Minute),
+			NetBirdControls: controls,
+			ExitNode:        exitNodePolicy{Mode: exitNodeUserControlled},
 		},
 		hasSnapshot: true,
 	}
 	raw := &fakeLifecycleServer{}
 	wrapper := &wrappedServer{LifecycleServer: raw, policy: controller}
 
-	if _, err := wrapper.Logout(context.Background(), &proto.LogoutRequest{}); err != nil {
-		t.Fatalf("Logout with ENABLED control: %v", err)
+	features, err := wrapper.GetFeatures(context.Background(), &proto.GetFeaturesRequest{})
+	if err != nil {
+		t.Fatalf("GetFeatures: %v", err)
 	}
-	if raw.logoutCalls != 1 {
-		t.Fatalf("raw Logout calls = %d, want 1", raw.logoutCalls)
+	if features.GetDisableProfiles() || features.GetDisableNetworks() {
+		t.Fatalf("valid false native controls were not honored: %+v", features)
 	}
 	if _, err := wrapper.SelectNetworks(context.Background(), &proto.SelectNetworksRequest{}); err != nil {
 		t.Fatalf("SelectNetworks with USER_CONTROLLED exit node: %v", err)
 	}
 
 	controller.snapshot.ValidUntil = fixedNow
-	if _, err := wrapper.Logout(context.Background(), &proto.LogoutRequest{}); status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("Logout after policy expiry error = %v, want PermissionDenied", err)
+	features, err = wrapper.GetFeatures(context.Background(), &proto.GetFeaturesRequest{})
+	if err != nil {
+		t.Fatalf("GetFeatures after expiry: %v", err)
+	}
+	if !features.GetDisableProfiles() || !features.GetDisableNetworks() {
+		t.Fatalf("expired native controls did not fail closed: %+v", features)
 	}
 }
 
@@ -295,6 +301,9 @@ func TestExitNodePolicyPinsAndDisablesOnlyDefaultRoutes(t *testing.T) {
 }
 
 func TestExitNodePolicyRejectsInvalidCombinations(t *testing.T) {
+	if err := validateNetBirdControls(netBirdControls{"disableUnknown": true}); err == nil {
+		t.Fatal("unknown native control was accepted")
+	}
 	if err := validateExitNode(exitNodePolicy{Mode: exitNodePinned}); err == nil {
 		t.Fatal("PINNED without network_id was accepted")
 	}

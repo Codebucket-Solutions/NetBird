@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://api.netbird.internal.codebuckets.in/schemas/client-policy-v2.json",
+  "$id": "https://api.netbird.internal.codebuckets.in/schemas/client-policy-v3.json",
   "title": "CodeBuckets NetBird client policy response",
   "description": "Authoritative response returned by POST /client-policy. Unknown fields are rejected by the client.",
   "type": "object",
@@ -13,12 +13,12 @@
     "issued_at",
     "valid_until",
     "reason_code",
-    "controls",
+    "netBirdControls",
     "exit_node"
   ],
   "properties": {
     "schema_version": {
-      "const": 2
+      "const": 3
     },
     "revision": {
       "type": "integer",
@@ -48,36 +48,19 @@
       "type": "string",
       "maxLength": 256
     },
-    "controls": {
+    "netBirdControls": {
       "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "logout",
-        "settings",
-        "profiles",
-        "networks",
-        "advanced_view",
-        "client_updates"
-      ],
-      "properties": {
-        "logout": {
-          "$ref": "#/$defs/controlMode"
-        },
-        "settings": {
-          "$ref": "#/$defs/controlMode"
-        },
-        "profiles": {
-          "$ref": "#/$defs/controlMode"
-        },
-        "networks": {
-          "$ref": "#/$defs/controlMode"
-        },
-        "advanced_view": {
-          "$ref": "#/$defs/controlMode"
-        },
-        "client_updates": {
-          "$ref": "#/$defs/controlMode"
-        }
+      "description": "Sparse map using NetBird's exact native MDM key names. Omitted keys retain strict client defaults.",
+      "propertyNames": {
+        "enum": [
+          "disableUpdateSettings",
+          "disableProfiles",
+          "disableNetworks",
+          "disableAdvancedView"
+        ]
+      },
+      "additionalProperties": {
+        "type": "boolean"
       }
     },
     "exit_node": {
@@ -123,12 +106,6 @@
     }
   },
   "$defs": {
-    "controlMode": {
-      "enum": [
-        "ENABLED",
-        "DISABLED"
-      ]
-    },
     "policyRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -146,7 +123,7 @@
       ],
       "properties": {
         "schema_version": {
-          "const": 2
+          "const": 3
         },
         "peer_public_key": {
           "type": "string"
@@ -209,20 +186,18 @@
   },
   "examples": [
     {
-      "schema_version": 2,
+      "schema_version": 3,
       "revision": 43,
       "policy_id": "account-default",
       "connection_mode": "REQUIRED",
       "issued_at": "2026-08-27T10:00:00Z",
       "valid_until": "2026-08-27T10:05:00Z",
       "reason_code": "ENTERPRISE_ALWAYS_ON",
-      "controls": {
-        "logout": "DISABLED",
-        "settings": "DISABLED",
-        "profiles": "DISABLED",
-        "networks": "DISABLED",
-        "advanced_view": "DISABLED",
-        "client_updates": "DISABLED"
+      "netBirdControls": {
+        "disableUpdateSettings": true,
+        "disableProfiles": true,
+        "disableNetworks": true,
+        "disableAdvancedView": true
       },
       "exit_node": {
         "mode": "PINNED",
@@ -258,21 +233,21 @@
       "value_type": "boolean",
       "category": "restriction",
       "support": "enforced",
-      "api_mapping": "controls.settings"
+      "api_mapping": "netBirdControls.disableUpdateSettings"
     },
     {
       "key": "disableProfiles",
       "value_type": "boolean",
       "category": "restriction",
       "support": "enforced",
-      "api_mapping": "controls.profiles"
+      "api_mapping": "netBirdControls.disableProfiles"
     },
     {
       "key": "disableNetworks",
       "value_type": "boolean",
       "category": "restriction",
       "support": "enforced",
-      "api_mapping": "controls.networks",
+      "api_mapping": "netBirdControls.disableNetworks",
       "notes": "Covers routed-network and exit-node selection UI/RPCs. Enterprise exit_node policy is evaluated separately."
     },
     {
@@ -280,7 +255,7 @@
       "value_type": "boolean",
       "category": "restriction",
       "support": "ui_only",
-      "api_mapping": "controls.advanced_view"
+      "api_mapping": "netBirdControls.disableAdvancedView"
     },
     {
       "key": "disableClientRoutes",
@@ -392,16 +367,16 @@
       "value_type": "enum:ENABLED|DISABLED",
       "category": "restriction",
       "support": "enterprise",
-      "api_mapping": "controls.logout",
-      "notes": "Not a native MDM key; enforced at the daemon RPC boundary."
+      "api_mapping": "compiled_disabled",
+      "notes": "Not a native MDM key; always disabled at the daemon RPC boundary."
     },
     {
       "key": "clientUpdates",
       "value_type": "enum:ENABLED|DISABLED",
       "category": "restriction",
       "support": "enterprise",
-      "api_mapping": "controls.client_updates",
-      "notes": "Controls the fork's update RPC independently from disableUpdateSettings."
+      "api_mapping": "compiled_disabled",
+      "notes": "The fork's update RPC is always disabled independently from disableUpdateSettings."
     },
     {
       "key": "exitNode",

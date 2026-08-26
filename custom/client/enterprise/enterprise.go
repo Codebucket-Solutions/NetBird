@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	gproto "google.golang.org/protobuf/proto"
 
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
+	"github.com/netbirdio/netbird/client/mdm"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/system"
 	"github.com/netbirdio/netbird/version"
@@ -37,7 +39,7 @@ const (
 	policyURL            = "https://api.netbird.internal.codebuckets.in/client-policy"
 	policyPollInterval   = 15 * time.Second
 	policyRequestTimeout = 5 * time.Second
-	enterpriseRevision   = "codebuckets.2"
+	enterpriseRevision   = "codebuckets.3"
 )
 
 // LifecycleServer is the narrow seam between NetBird and the enterprise
@@ -55,7 +57,6 @@ const (
 )
 
 type connectionMode string
-type controlMode string
 type exitNodeMode string
 
 const (
@@ -63,21 +64,18 @@ const (
 	modeUserControlled connectionMode = "USER_CONTROLLED"
 	modeAdminDisabled  connectionMode = "ADMIN_DISABLED"
 
-	controlEnabled  controlMode = "ENABLED"
-	controlDisabled controlMode = "DISABLED"
-
 	exitNodeDisabled       exitNodeMode = "DISABLED"
 	exitNodePinned         exitNodeMode = "PINNED"
 	exitNodeUserControlled exitNodeMode = "USER_CONTROLLED"
 )
 
-type clientControls struct {
-	Logout        controlMode `json:"logout"`
-	Settings      controlMode `json:"settings"`
-	Profiles      controlMode `json:"profiles"`
-	Networks      controlMode `json:"networks"`
-	AdvancedView  controlMode `json:"advanced_view"`
-	ClientUpdates controlMode `json:"client_updates"`
+type netBirdControls map[string]bool
+
+var supportedNetBirdControls = map[string]struct{}{
+	mdm.KeyDisableUpdateSettings: {},
+	mdm.KeyDisableProfiles:       {},
+	mdm.KeyDisableNetworks:       {},
+	mdm.KeyDisableAdvancedView:   {},
 }
 
 type exitNodePolicy struct {
@@ -104,15 +102,15 @@ type exitNodeState struct {
 }
 
 type policyResponse struct {
-	SchemaVersion  int            `json:"schema_version"`
-	Revision       uint64         `json:"revision"`
-	PolicyID       string         `json:"policy_id"`
-	ConnectionMode connectionMode `json:"connection_mode"`
-	IssuedAt       time.Time      `json:"issued_at"`
-	ValidUntil     time.Time      `json:"valid_until"`
-	ReasonCode     string         `json:"reason_code"`
-	Controls       clientControls `json:"controls"`
-	ExitNode       exitNodePolicy `json:"exit_node"`
+	SchemaVersion   int             `json:"schema_version"`
+	Revision        uint64          `json:"revision"`
+	PolicyID        string          `json:"policy_id"`
+	ConnectionMode  connectionMode  `json:"connection_mode"`
+	IssuedAt        time.Time       `json:"issued_at"`
+	ValidUntil      time.Time       `json:"valid_until"`
+	ReasonCode      string          `json:"reason_code"`
+	NetBirdControls netBirdControls `json:"netBirdControls"`
+	ExitNode         exitNodePolicy  `json:"exit_node"`
 }
 
 type policyController struct {
@@ -176,7 +174,7 @@ func (p *policyController) poll(ctx context.Context) error {
 	now := p.now()
 	info := system.GetInfo(ctx)
 	requestPayload := policyRequest{
-		SchemaVersion:         2,
+		SchemaVersion:         3,
 		PeerPublicKey:         p.peerPublicKey,
 		SystemSerialNumber:    normalizeSerial(info.SystemSerialNumber),
 		Hostname:              info.Hostname,
@@ -274,7 +272,7 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 func (p *policyController) accept(candidate policyResponse, now time.Time) error {
-	if candidate.SchemaVersion != 2 || candidate.Revision == 0 || candidate.PolicyID == "" {
+	if candidate.SchemaVersion != 3 || candidate.Revision == 0 || candidate.PolicyID == "" {
 		return errors.New("missing or unsupported policy identity")
 	}
 	if len(candidate.PolicyID) > 256 || len(candidate.ReasonCode) > 256 {
@@ -285,7 +283,7 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 		candidate.ConnectionMode != modeAdminDisabled {
 		return fmt.Errorf("unsupported connection mode %q", candidate.ConnectionMode)
 	}
-	if err := validateControls(candidate.Controls); err != nil {
+	if err := validateNetBirdControls(candidate.NetBirdControls); err != nil {
 		return err
 	}
 	if err := validateExitNode(candidate.ExitNode); err != nil {
@@ -305,7 +303,7 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 	if p.hasSnapshot && candidate.Revision < p.snapshot.Revision {
 		return errors.New("policy revision rollback")
 	}
-	if p.hasSnapshot && candidate.Revision == p.snapshot.Revision && candidate != p.snapshot {
+	if p.hasSnapshot && candidate.Revision == p.snapshot.Revision && !reflect.DeepEqual(candidate, p.snapshot) {
 		return errors.New("policy content changed without a revision increment")
 	}
 	p.snapshot = candidate
@@ -313,18 +311,13 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 	return nil
 }
 
-func validateControls(controls clientControls) error {
-	values := map[string]controlMode{
-		"logout":         controls.Logout,
-		"settings":       controls.Settings,
-		"profiles":       controls.Profiles,
-		"networks":       controls.Networks,
-		"advanced_view":  controls.AdvancedView,
-		"client_updates": controls.ClientUpdates,
+func validateNetBirdControls(controls netBirdControls) error {
+	if controls == nil {
+		return errors.New("netBirdControls is required")
 	}
-	for name, value := range values {
-		if value != controlEnabled && value != controlDisabled {
-			return fmt.Errorf("unsupported %s control mode %q", name, value)
+	for name := range controls {
+		if _, supported := supportedNetBirdControls[name]; !supported {
+			return fmt.Errorf("unsupported NetBird control %q", name)
 		}
 	}
 	return nil
@@ -361,24 +354,26 @@ func (p *policyController) mode(now time.Time) connectionMode {
 	return p.snapshot.ConnectionMode
 }
 
-func strictControls() clientControls {
-	return clientControls{
-		Logout:        controlDisabled,
-		Settings:      controlDisabled,
-		Profiles:      controlDisabled,
-		Networks:      controlDisabled,
-		AdvancedView:  controlDisabled,
-		ClientUpdates: controlDisabled,
+func strictNetBirdControls() netBirdControls {
+	return netBirdControls{
+		mdm.KeyDisableUpdateSettings: true,
+		mdm.KeyDisableProfiles:       true,
+		mdm.KeyDisableNetworks:       true,
+		mdm.KeyDisableAdvancedView:   true,
 	}
 }
 
-func (p *policyController) controls(now time.Time) clientControls {
+func (p *policyController) netBirdControls(now time.Time) netBirdControls {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if !p.hasSnapshot || !p.snapshot.ValidUntil.After(now) {
-		return strictControls()
+		return strictNetBirdControls()
 	}
-	return p.snapshot.Controls
+	controls := strictNetBirdControls()
+	for key, value := range p.snapshot.NetBirdControls {
+		controls[key] = value
+	}
+	return controls
 }
 
 func (p *policyController) exitNode(now time.Time) exitNodePolicy {
@@ -599,11 +594,11 @@ func (s *wrappedServer) effectiveMode() connectionMode {
 	return s.policy.mode(s.policy.now())
 }
 
-func (s *wrappedServer) effectiveControls() clientControls {
+func (s *wrappedServer) netBirdControl(key string) bool {
 	if s.policy == nil {
-		return strictControls()
+		return strictNetBirdControls()[key]
 	}
-	return s.policy.controls(s.policy.now())
+	return s.policy.netBirdControls(s.policy.now())[key]
 }
 
 func (s *wrappedServer) effectiveExitNode() exitNodePolicy {
@@ -644,11 +639,8 @@ func (s *wrappedServer) Down(ctx context.Context, request *proto.DownRequest) (*
 	return s.LifecycleServer.Down(ctx, request)
 }
 
-func (s *wrappedServer) Logout(ctx context.Context, request *proto.LogoutRequest) (*proto.LogoutResponse, error) {
-	if s.effectiveControls().Logout == controlDisabled {
-		return nil, status.Error(codes.PermissionDenied, errLogoutDisabled)
-	}
-	return s.LifecycleServer.Logout(ctx, request)
+func (s *wrappedServer) Logout(context.Context, *proto.LogoutRequest) (*proto.LogoutResponse, error) {
+	return nil, status.Error(codes.PermissionDenied, errLogoutDisabled)
 }
 
 func (s *wrappedServer) GetConfig(ctx context.Context, request *proto.GetConfigRequest) (*proto.GetConfigResponse, error) {
@@ -668,11 +660,13 @@ func (s *wrappedServer) GetFeatures(ctx context.Context, request *proto.GetFeatu
 	if response == nil {
 		response = &proto.GetFeaturesResponse{}
 	}
-	controls := s.effectiveControls()
-	response.DisableProfiles = controls.Profiles == controlDisabled
-	response.DisableUpdateSettings = controls.Settings == controlDisabled
-	response.DisableNetworks = controls.Networks == controlDisabled
-	advancedViewDisabled := controls.AdvancedView == controlDisabled
+	response.DisableProfiles = response.DisableProfiles || s.netBirdControl(mdm.KeyDisableProfiles)
+	response.DisableUpdateSettings = response.DisableUpdateSettings || s.netBirdControl(mdm.KeyDisableUpdateSettings)
+	response.DisableNetworks = response.DisableNetworks || s.netBirdControl(mdm.KeyDisableNetworks)
+	advancedViewDisabled := s.netBirdControl(mdm.KeyDisableAdvancedView)
+	if response.DisableAdvancedView != nil {
+		advancedViewDisabled = advancedViewDisabled || response.GetDisableAdvancedView()
+	}
 	response.DisableAdvancedView = &advancedViewDisabled
 	return response, nil
 }
@@ -682,7 +676,7 @@ func settingsDisabled() error {
 }
 
 func (s *wrappedServer) SetConfig(ctx context.Context, request *proto.SetConfigRequest) (*proto.SetConfigResponse, error) {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return nil, settingsDisabled()
 	}
 	if request == nil {
@@ -696,86 +690,81 @@ func (s *wrappedServer) SetConfig(ctx context.Context, request *proto.SetConfigR
 }
 
 func (s *wrappedServer) SelectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	controls := s.effectiveControls()
-	if controls.Networks == controlDisabled || s.effectiveExitNode().Mode != exitNodeUserControlled {
+	if s.netBirdControl(mdm.KeyDisableNetworks) || s.effectiveExitNode().Mode != exitNodeUserControlled {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.SelectNetworks(ctx, request)
 }
 
 func (s *wrappedServer) DeselectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	controls := s.effectiveControls()
-	if controls.Networks == controlDisabled || s.effectiveExitNode().Mode != exitNodeUserControlled {
+	if s.netBirdControl(mdm.KeyDisableNetworks) || s.effectiveExitNode().Mode != exitNodeUserControlled {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.DeselectNetworks(ctx, request)
 }
 
 func (s *wrappedServer) SetLogLevel(ctx context.Context, request *proto.SetLogLevelRequest) (*proto.SetLogLevelResponse, error) {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.SetLogLevel(ctx, request)
 }
 
 func (s *wrappedServer) CleanState(ctx context.Context, request *proto.CleanStateRequest) (*proto.CleanStateResponse, error) {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.CleanState(ctx, request)
 }
 
 func (s *wrappedServer) DeleteState(ctx context.Context, request *proto.DeleteStateRequest) (*proto.DeleteStateResponse, error) {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.DeleteState(ctx, request)
 }
 
 func (s *wrappedServer) SetSyncResponsePersistence(ctx context.Context, request *proto.SetSyncResponsePersistenceRequest) (*proto.SetSyncResponsePersistenceResponse, error) {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.SetSyncResponsePersistence(ctx, request)
 }
 
 func (s *wrappedServer) SwitchProfile(ctx context.Context, request *proto.SwitchProfileRequest) (*proto.SwitchProfileResponse, error) {
-	if s.effectiveControls().Profiles == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableProfiles) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.SwitchProfile(ctx, request)
 }
 
 func (s *wrappedServer) AddProfile(ctx context.Context, request *proto.AddProfileRequest) (*proto.AddProfileResponse, error) {
-	if s.effectiveControls().Profiles == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableProfiles) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.AddProfile(ctx, request)
 }
 
 func (s *wrappedServer) RenameProfile(ctx context.Context, request *proto.RenameProfileRequest) (*proto.RenameProfileResponse, error) {
-	if s.effectiveControls().Profiles == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableProfiles) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.RenameProfile(ctx, request)
 }
 
 func (s *wrappedServer) RemoveProfile(ctx context.Context, request *proto.RemoveProfileRequest) (*proto.RemoveProfileResponse, error) {
-	if s.effectiveControls().Profiles == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableProfiles) {
 		return nil, settingsDisabled()
 	}
 	return s.LifecycleServer.RemoveProfile(ctx, request)
 }
 
-func (s *wrappedServer) TriggerUpdate(ctx context.Context, request *proto.TriggerUpdateRequest) (*proto.TriggerUpdateResponse, error) {
-	if s.effectiveControls().ClientUpdates == controlDisabled {
-		return nil, settingsDisabled()
-	}
-	return s.LifecycleServer.TriggerUpdate(ctx, request)
+func (s *wrappedServer) TriggerUpdate(context.Context, *proto.TriggerUpdateRequest) (*proto.TriggerUpdateResponse, error) {
+	return nil, settingsDisabled()
 }
 
 func (s *wrappedServer) ExposeService(request *proto.ExposeServiceRequest, stream proto.DaemonService_ExposeServiceServer) error {
-	if s.effectiveControls().Settings == controlDisabled {
+	if s.netBirdControl(mdm.KeyDisableUpdateSettings) {
 		return settingsDisabled()
 	}
 	return s.LifecycleServer.ExposeService(request, stream)

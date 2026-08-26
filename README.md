@@ -25,10 +25,12 @@ remains disabled in `overlay.config.json` until every platform signing gate is
 ready.
 
 The machine-readable API contract and complete v0.77.1 native MDM capability
-inventory live in `policy/client-policy.schema.json`. Policy schema v2 controls
-connection state, daemon/UI restrictions, and exit-node behavior. Exit nodes
+inventory live in `policy/client-policy.schema.json`. Policy schema v3 uses a
+sparse `netBirdControls` object whose keys exactly match native MDM names, plus
+connection-state and exit-node policy. Exit nodes
 support `PINNED`, `DISABLED`, and `USER_CONTROLLED`; strict behavior is used when
-no valid policy is available.
+no valid policy is available. Qualification compares the JSON key allow-list,
+the Go enforcement registry, and upstream MDM constants so they cannot drift.
 
 ## Local materialization
 
