@@ -18,9 +18,13 @@ import (
 
 type fakeLifecycleServer struct {
 	proto.UnimplementedDaemonServiceServer
-	upCalls   int
-	downCalls int
-	features  *proto.GetFeaturesResponse
+	upCalls          int
+	downCalls        int
+	logoutCalls      int
+	features         *proto.GetFeaturesResponse
+	networks         []*proto.Network
+	selectRequests   []*proto.SelectNetworksRequest
+	deselectRequests []*proto.SelectNetworksRequest
 }
 
 func (*fakeLifecycleServer) Start() error {
@@ -35,6 +39,25 @@ func (f *fakeLifecycleServer) Up(context.Context, *proto.UpRequest) (*proto.UpRe
 func (f *fakeLifecycleServer) Down(context.Context, *proto.DownRequest) (*proto.DownResponse, error) {
 	f.downCalls++
 	return &proto.DownResponse{}, nil
+}
+
+func (f *fakeLifecycleServer) Logout(context.Context, *proto.LogoutRequest) (*proto.LogoutResponse, error) {
+	f.logoutCalls++
+	return &proto.LogoutResponse{}, nil
+}
+
+func (f *fakeLifecycleServer) ListNetworks(context.Context, *proto.ListNetworksRequest) (*proto.ListNetworksResponse, error) {
+	return &proto.ListNetworksResponse{Routes: f.networks}, nil
+}
+
+func (f *fakeLifecycleServer) SelectNetworks(_ context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
+	f.selectRequests = append(f.selectRequests, request)
+	return &proto.SelectNetworksResponse{}, nil
+}
+
+func (f *fakeLifecycleServer) DeselectNetworks(_ context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
+	f.deselectRequests = append(f.deselectRequests, request)
+	return &proto.SelectNetworksResponse{}, nil
 }
 
 func (f *fakeLifecycleServer) GetFeatures(context.Context, *proto.GetFeaturesRequest) (*proto.GetFeaturesResponse, error) {
@@ -69,16 +92,24 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 		if payload["peer_public_key"] != "test-peer-key" {
 			t.Errorf("peer_public_key = %v, want test-peer-key", payload["peer_public_key"])
 		}
+		if payload["schema_version"] != float64(2) {
+			t.Errorf("schema_version = %v, want 2", payload["schema_version"])
+		}
+		if _, ok := payload["exit_node_state"]; !ok {
+			t.Error("request does not contain exit_node_state")
+		}
 
 		writer.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(writer).Encode(policyResponse{
-			SchemaVersion:  1,
+			SchemaVersion:  2,
 			Revision:       1,
 			PolicyID:       "test-policy",
 			ConnectionMode: modeAdminDisabled,
 			IssuedAt:       fixedNow.Add(-time.Minute),
 			ValidUntil:     fixedNow.Add(time.Minute),
 			ReasonCode:     "TEST",
+			Controls:       strictControls(),
+			ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
 		}); err != nil {
 			t.Fatalf("encode response: %v", err)
 		}
@@ -108,12 +139,14 @@ func TestPolicyIsFailClosedAndRejectsRollback(t *testing.T) {
 	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
 	controller := &policyController{now: func() time.Time { return fixedNow }}
 	valid := policyResponse{
-		SchemaVersion:  1,
+		SchemaVersion:  2,
 		Revision:       2,
 		PolicyID:       "support-window",
 		ConnectionMode: modeUserControlled,
 		IssuedAt:       fixedNow.Add(-time.Minute),
 		ValidUntil:     fixedNow.Add(time.Minute),
+		Controls:       strictControls(),
+		ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
 	}
 	if err := controller.accept(valid, fixedNow); err != nil {
 		t.Fatalf("accept valid policy: %v", err)
@@ -166,12 +199,14 @@ func TestWrapperHonorsServerConnectionModes(t *testing.T) {
 		raw: raw,
 		now: func() time.Time { return fixedNow },
 		snapshot: policyResponse{
-			SchemaVersion:  1,
+			SchemaVersion:  2,
 			Revision:       1,
 			PolicyID:       "connection-policy",
 			ConnectionMode: modeUserControlled,
 			IssuedAt:       fixedNow.Add(-time.Minute),
 			ValidUntil:     fixedNow.Add(time.Minute),
+			Controls:       strictControls(),
+			ExitNode:       exitNodePolicy{Mode: exitNodeDisabled},
 		},
 		hasSnapshot: true,
 	}
@@ -190,6 +225,84 @@ func TestWrapperHonorsServerConnectionModes(t *testing.T) {
 	}
 	if raw.upCalls != 0 {
 		t.Fatalf("raw Up calls = %d, want 0", raw.upCalls)
+	}
+}
+
+func TestPolicyControlsCanBeRelaxedOnlyByValidCurrentPolicy(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	controls := strictControls()
+	controls.Logout = controlEnabled
+	controls.Networks = controlEnabled
+	controller := &policyController{
+		now: func() time.Time { return fixedNow },
+		snapshot: policyResponse{
+			ValidUntil: fixedNow.Add(time.Minute),
+			Controls:   controls,
+			ExitNode:   exitNodePolicy{Mode: exitNodeUserControlled},
+		},
+		hasSnapshot: true,
+	}
+	raw := &fakeLifecycleServer{}
+	wrapper := &wrappedServer{LifecycleServer: raw, policy: controller}
+
+	if _, err := wrapper.Logout(context.Background(), &proto.LogoutRequest{}); err != nil {
+		t.Fatalf("Logout with ENABLED control: %v", err)
+	}
+	if raw.logoutCalls != 1 {
+		t.Fatalf("raw Logout calls = %d, want 1", raw.logoutCalls)
+	}
+	if _, err := wrapper.SelectNetworks(context.Background(), &proto.SelectNetworksRequest{}); err != nil {
+		t.Fatalf("SelectNetworks with USER_CONTROLLED exit node: %v", err)
+	}
+
+	controller.snapshot.ValidUntil = fixedNow
+	if _, err := wrapper.Logout(context.Background(), &proto.LogoutRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("Logout after policy expiry error = %v, want PermissionDenied", err)
+	}
+}
+
+func TestExitNodePolicyPinsAndDisablesOnlyDefaultRoutes(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	raw := &fakeLifecycleServer{networks: []*proto.Network{
+		{ID: "exit-a", Range: "0.0.0.0/0, ::/0"},
+		{ID: "exit-b", Range: "0.0.0.0/0", Selected: true},
+		{ID: "corp", Range: "10.0.0.0/8", Selected: true},
+	}}
+	controller := &policyController{
+		raw: raw,
+		now: func() time.Time { return fixedNow },
+		snapshot: policyResponse{
+			ValidUntil: fixedNow.Add(time.Minute),
+			ExitNode:   exitNodePolicy{Mode: exitNodePinned, NetworkID: "exit-a"},
+		},
+		hasSnapshot: true,
+	}
+
+	controller.reconcileExitNode(context.Background())
+	if len(raw.selectRequests) != 1 || len(raw.selectRequests[0].GetNetworkIDs()) != 1 ||
+		raw.selectRequests[0].GetNetworkIDs()[0] != "exit-a" || !raw.selectRequests[0].GetAppend() {
+		t.Fatalf("pin request = %+v, want append selection of exit-a", raw.selectRequests)
+	}
+
+	controller.snapshot.ExitNode = exitNodePolicy{Mode: exitNodeDisabled}
+	raw.networks[0].Selected = true
+	raw.networks[1].Selected = false
+	controller.reconcileExitNode(context.Background())
+	if len(raw.deselectRequests) != 1 || len(raw.deselectRequests[0].GetNetworkIDs()) != 1 ||
+		raw.deselectRequests[0].GetNetworkIDs()[0] != "exit-a" {
+		t.Fatalf("disable request = %+v, want only exit-a", raw.deselectRequests)
+	}
+}
+
+func TestExitNodePolicyRejectsInvalidCombinations(t *testing.T) {
+	if err := validateExitNode(exitNodePolicy{Mode: exitNodePinned}); err == nil {
+		t.Fatal("PINNED without network_id was accepted")
+	}
+	if err := validateExitNode(exitNodePolicy{Mode: exitNodeDisabled, NetworkID: "exit-a"}); err == nil {
+		t.Fatal("DISABLED with network_id was accepted")
+	}
+	if !isExitNodeRange("0.0.0.0/0, ::/0") || isExitNodeRange("10.0.0.0/8") {
+		t.Fatal("exit-node range classification is incorrect")
 	}
 }
 

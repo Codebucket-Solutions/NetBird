@@ -24,6 +24,12 @@ under `custom/client/enterprise`, outside the patch. Production publication
 remains disabled in `overlay.config.json` until every platform signing gate is
 ready.
 
+The machine-readable API contract and complete v0.77.1 native MDM capability
+inventory live in `policy/client-policy.schema.json`. Policy schema v2 controls
+connection state, daemon/UI restrictions, and exit-node behavior. Exit nodes
+support `PINNED`, `DISABLED`, and `USER_CONTROLLED`; strict behavior is used when
+no valid policy is available.
+
 ## Local materialization
 
 From Windows, macOS, or Linux:

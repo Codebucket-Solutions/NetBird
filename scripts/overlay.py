@@ -95,6 +95,47 @@ def require_schema(lock: dict[str, Any], config: dict[str, Any]) -> None:
         raise RuntimeError("unsupported overlay or lock schema version")
 
 
+def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: str) -> None:
+    config = read_json(overlay_root / "overlay.config.json")
+    schema = read_json(overlay_root / "policy" / "client-policy.schema.json")
+    schema_version = schema.get("properties", {}).get("schema_version", {}).get("const")
+    if schema_version != config.get("policy_schema_version"):
+        raise RuntimeError("policy JSON schema version does not match overlay.config.json")
+
+    catalog = schema.get("x-netbird-mdm-catalog")
+    if not isinstance(catalog, list) or not catalog:
+        raise RuntimeError("policy JSON schema has no MDM capability catalog")
+    catalog_keys = [str(item.get("key", "")) for item in catalog if isinstance(item, dict)]
+    if not all(catalog_keys) or len(catalog_keys) != len(set(catalog_keys)):
+        raise RuntimeError("policy MDM capability catalog contains empty or duplicate keys")
+
+    native_catalog_keys = {
+        str(item["key"])
+        for item in catalog
+        if isinstance(item, dict) and item.get("support") != "enterprise"
+    }
+    mdm_source = (source / "client" / "mdm" / "policy.go").read_text(encoding="utf-8")
+    native_source_keys = set(re.findall(r'Key[A-Za-z0-9]+\s*=\s*"([^"]+)"', mdm_source))
+    if native_catalog_keys != native_source_keys:
+        missing = sorted(native_source_keys - native_catalog_keys)
+        stale = sorted(native_catalog_keys - native_source_keys)
+        raise RuntimeError(
+            "policy MDM catalog drifted from locked upstream "
+            f"(missing={missing}, stale={stale})"
+        )
+
+    required_literals = (
+        f"SchemaVersion:         {schema_version}",
+        f'enterpriseRevision   = "codebuckets.{config["enterprise_revision"]}"',
+        'json:"controls"',
+        'json:"exit_node"',
+        'exitNodePinned         exitNodeMode = "PINNED"',
+    )
+    for required in required_literals:
+        if required not in enterprise_text:
+            raise RuntimeError(f"enterprise implementation is missing policy contract invariant: {required}")
+
+
 def series_entries(path: Path) -> list[str]:
     if not path.is_file():
         raise RuntimeError(f"patch series does not exist: {path}")
@@ -252,6 +293,7 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
                 raise RuntimeError(f"enterprise implementation is missing invariant: {required}")
         if config["policy_poll_interval_seconds"] != 15:
             raise RuntimeError("enterprise policy poll interval must be 15 seconds")
+        verify_policy_contract(source, overlay_root, enterprise_text)
 
     result = {
         "base_commit": base,
@@ -423,6 +465,7 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
         print_result(verify_source(destination, overlay_root, args.require_enterprise_hook))
 
     manifest_path = overlay_root / "patches" / "manifest.sha256"
+    policy_contract_path = overlay_root / "policy" / "client-policy.schema.json"
     overlay_head = run("git", "rev-parse", "--verify", "HEAD", cwd=overlay_root, check=False)
     provenance = {
         "schema_version": 1,
@@ -434,6 +477,7 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
         "patch_count": len(patch_entries),
         "custom_source_sha256": custom_source_sha256,
         "custom_file_count": len(custom_inventory),
+        "policy_contract_sha256": hashlib.sha256(policy_contract_path.read_bytes()).hexdigest(),
         "source_head": run("git", "rev-parse", "HEAD", cwd=destination).stdout.strip(),
         "source_tree": run("git", "rev-parse", "HEAD^{tree}", cwd=destination).stdout.strip(),
         "materialized_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

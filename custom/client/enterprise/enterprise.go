@@ -12,7 +12,9 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,7 @@ const (
 	policyURL            = "https://api.netbird.internal.codebuckets.in/client-policy"
 	policyPollInterval   = 15 * time.Second
 	policyRequestTimeout = 5 * time.Second
-	enterpriseRevision   = "codebuckets.1"
+	enterpriseRevision   = "codebuckets.2"
 )
 
 // LifecycleServer is the narrow seam between NetBird and the enterprise
@@ -53,23 +55,52 @@ const (
 )
 
 type connectionMode string
+type controlMode string
+type exitNodeMode string
 
 const (
 	modeRequired       connectionMode = "REQUIRED"
 	modeUserControlled connectionMode = "USER_CONTROLLED"
 	modeAdminDisabled  connectionMode = "ADMIN_DISABLED"
+
+	controlEnabled  controlMode = "ENABLED"
+	controlDisabled controlMode = "DISABLED"
+
+	exitNodeDisabled       exitNodeMode = "DISABLED"
+	exitNodePinned         exitNodeMode = "PINNED"
+	exitNodeUserControlled exitNodeMode = "USER_CONTROLLED"
 )
 
+type clientControls struct {
+	Logout        controlMode `json:"logout"`
+	Settings      controlMode `json:"settings"`
+	Profiles      controlMode `json:"profiles"`
+	Networks      controlMode `json:"networks"`
+	AdvancedView  controlMode `json:"advanced_view"`
+	ClientUpdates controlMode `json:"client_updates"`
+}
+
+type exitNodePolicy struct {
+	Mode      exitNodeMode `json:"mode"`
+	NetworkID string       `json:"network_id"`
+}
+
 type policyRequest struct {
-	SchemaVersion         int    `json:"schema_version"`
-	PeerPublicKey         string `json:"peer_public_key"`
-	SystemSerialNumber    string `json:"system_serial_number"`
-	Hostname              string `json:"hostname"`
-	OS                    string `json:"os"`
-	OSVersion             string `json:"os_version"`
-	UpstreamVersion       string `json:"upstream_version"`
-	EnterpriseRevision    string `json:"enterprise_revision"`
-	CurrentPolicyRevision uint64 `json:"current_policy_revision"`
+	SchemaVersion         int           `json:"schema_version"`
+	PeerPublicKey         string        `json:"peer_public_key"`
+	SystemSerialNumber    string        `json:"system_serial_number"`
+	Hostname              string        `json:"hostname"`
+	OS                    string        `json:"os"`
+	OSVersion             string        `json:"os_version"`
+	UpstreamVersion       string        `json:"upstream_version"`
+	EnterpriseRevision    string        `json:"enterprise_revision"`
+	CurrentPolicyRevision uint64        `json:"current_policy_revision"`
+	ExitNodeState         exitNodeState `json:"exit_node_state"`
+}
+
+type exitNodeState struct {
+	AvailableNetworkIDs []string `json:"available_network_ids"`
+	SelectedNetworkIDs  []string `json:"selected_network_ids"`
 }
 
 type policyResponse struct {
@@ -80,6 +111,8 @@ type policyResponse struct {
 	IssuedAt       time.Time      `json:"issued_at"`
 	ValidUntil     time.Time      `json:"valid_until"`
 	ReasonCode     string         `json:"reason_code"`
+	Controls       clientControls `json:"controls"`
+	ExitNode       exitNodePolicy `json:"exit_node"`
 }
 
 type policyController struct {
@@ -143,7 +176,7 @@ func (p *policyController) poll(ctx context.Context) error {
 	now := p.now()
 	info := system.GetInfo(ctx)
 	requestPayload := policyRequest{
-		SchemaVersion:         1,
+		SchemaVersion:         2,
 		PeerPublicKey:         p.peerPublicKey,
 		SystemSerialNumber:    normalizeSerial(info.SystemSerialNumber),
 		Hostname:              info.Hostname,
@@ -152,6 +185,7 @@ func (p *policyController) poll(ctx context.Context) error {
 		UpstreamVersion:       version.NetbirdVersion(),
 		EnterpriseRevision:    enterpriseRevision,
 		CurrentPolicyRevision: p.currentRevision(),
+		ExitNodeState:         p.observeExitNodes(ctx),
 	}
 	body, err := json.Marshal(requestPayload)
 	if err != nil {
@@ -205,6 +239,29 @@ func (p *policyController) poll(ctx context.Context) error {
 	return nil
 }
 
+func (p *policyController) observeExitNodes(ctx context.Context) exitNodeState {
+	state := exitNodeState{
+		AvailableNetworkIDs: []string{},
+		SelectedNetworkIDs:  []string{},
+	}
+	response, err := p.raw.ListNetworks(ctx, &proto.ListNetworksRequest{})
+	if err != nil {
+		return state
+	}
+	for _, network := range response.GetRoutes() {
+		if network == nil || !isExitNodeRange(network.GetRange()) {
+			continue
+		}
+		state.AvailableNetworkIDs = append(state.AvailableNetworkIDs, network.GetID())
+		if network.GetSelected() {
+			state.SelectedNetworkIDs = append(state.SelectedNetworkIDs, network.GetID())
+		}
+	}
+	sort.Strings(state.AvailableNetworkIDs)
+	sort.Strings(state.SelectedNetworkIDs)
+	return state
+}
+
 func ensureJSONEOF(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
@@ -217,7 +274,7 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 func (p *policyController) accept(candidate policyResponse, now time.Time) error {
-	if candidate.SchemaVersion != 1 || candidate.Revision == 0 || candidate.PolicyID == "" {
+	if candidate.SchemaVersion != 2 || candidate.Revision == 0 || candidate.PolicyID == "" {
 		return errors.New("missing or unsupported policy identity")
 	}
 	if len(candidate.PolicyID) > 256 || len(candidate.ReasonCode) > 256 {
@@ -227,6 +284,12 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 		candidate.ConnectionMode != modeUserControlled &&
 		candidate.ConnectionMode != modeAdminDisabled {
 		return fmt.Errorf("unsupported connection mode %q", candidate.ConnectionMode)
+	}
+	if err := validateControls(candidate.Controls); err != nil {
+		return err
+	}
+	if err := validateExitNode(candidate.ExitNode); err != nil {
+		return err
 	}
 	if candidate.IssuedAt.IsZero() || candidate.ValidUntil.IsZero() ||
 		candidate.IssuedAt.After(now.Add(maxClockSkew)) || !candidate.ValidUntil.After(now) ||
@@ -250,6 +313,45 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 	return nil
 }
 
+func validateControls(controls clientControls) error {
+	values := map[string]controlMode{
+		"logout":         controls.Logout,
+		"settings":       controls.Settings,
+		"profiles":       controls.Profiles,
+		"networks":       controls.Networks,
+		"advanced_view":  controls.AdvancedView,
+		"client_updates": controls.ClientUpdates,
+	}
+	for name, value := range values {
+		if value != controlEnabled && value != controlDisabled {
+			return fmt.Errorf("unsupported %s control mode %q", name, value)
+		}
+	}
+	return nil
+}
+
+func validateExitNode(policy exitNodePolicy) error {
+	if policy.NetworkID != strings.TrimSpace(policy.NetworkID) {
+		return errors.New("exit-node network ID has surrounding whitespace")
+	}
+	if len(policy.NetworkID) > 256 {
+		return errors.New("exit-node network ID is too long")
+	}
+	switch policy.Mode {
+	case exitNodePinned:
+		if policy.NetworkID == "" {
+			return errors.New("PINNED exit-node policy requires network_id")
+		}
+	case exitNodeDisabled, exitNodeUserControlled:
+		if policy.NetworkID != "" {
+			return fmt.Errorf("%s exit-node policy must not set network_id", policy.Mode)
+		}
+	default:
+		return fmt.Errorf("unsupported exit-node mode %q", policy.Mode)
+	}
+	return nil
+}
+
 func (p *policyController) mode(now time.Time) connectionMode {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -257,6 +359,35 @@ func (p *policyController) mode(now time.Time) connectionMode {
 		return modeRequired
 	}
 	return p.snapshot.ConnectionMode
+}
+
+func strictControls() clientControls {
+	return clientControls{
+		Logout:        controlDisabled,
+		Settings:      controlDisabled,
+		Profiles:      controlDisabled,
+		Networks:      controlDisabled,
+		AdvancedView:  controlDisabled,
+		ClientUpdates: controlDisabled,
+	}
+}
+
+func (p *policyController) controls(now time.Time) clientControls {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.hasSnapshot || !p.snapshot.ValidUntil.After(now) {
+		return strictControls()
+	}
+	return p.snapshot.Controls
+}
+
+func (p *policyController) exitNode(now time.Time) exitNodePolicy {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.hasSnapshot || !p.snapshot.ValidUntil.After(now) {
+		return exitNodePolicy{Mode: exitNodeDisabled}
+	}
+	return p.snapshot.ExitNode
 }
 
 func (p *policyController) currentRevision() uint64 {
@@ -271,32 +402,96 @@ func (p *policyController) currentRevision() uint64 {
 func (p *policyController) reconcile(parent context.Context) {
 	mode := p.mode(p.now())
 	p.mu.RLock()
-	if mode == p.lastReconciled {
-		p.mu.RUnlock()
-		return
-	}
+	alreadyReconciled := mode == p.lastReconciled
 	p.mu.RUnlock()
 
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	switch mode {
-	case modeRequired:
-		if _, err := p.raw.Up(ctx, &proto.UpRequest{Async: true}); err != nil {
-			log.Warnf("enterprise policy could not converge to REQUIRED: %v", err)
-			return
+	if !alreadyReconciled {
+		switch mode {
+		case modeRequired:
+			if _, err := p.raw.Up(ctx, &proto.UpRequest{Async: true}); err != nil {
+				log.Warnf("enterprise policy could not converge to REQUIRED: %v", err)
+				return
+			}
+		case modeAdminDisabled:
+			if _, err := p.raw.Down(ctx, &proto.DownRequest{}); err != nil {
+				log.Warnf("enterprise policy could not converge to ADMIN_DISABLED: %v", err)
+				return
+			}
+		case modeUserControlled:
+			// A valid, short-lived relaxation preserves the user's current intent.
 		}
-	case modeAdminDisabled:
-		if _, err := p.raw.Down(ctx, &proto.DownRequest{}); err != nil {
-			log.Warnf("enterprise policy could not converge to ADMIN_DISABLED: %v", err)
-			return
-		}
-	case modeUserControlled:
-		// A valid, short-lived relaxation preserves the user's current intent.
+
+		p.mu.Lock()
+		p.lastReconciled = mode
+		p.mu.Unlock()
 	}
 
-	p.mu.Lock()
-	p.lastReconciled = mode
-	p.mu.Unlock()
+	if mode != modeAdminDisabled {
+		p.reconcileExitNode(ctx)
+	}
+}
+
+func (p *policyController) reconcileExitNode(ctx context.Context) {
+	policy := p.exitNode(p.now())
+	if policy.Mode == exitNodeUserControlled {
+		return
+	}
+
+	response, err := p.raw.ListNetworks(ctx, &proto.ListNetworksRequest{})
+	if err != nil {
+		log.Debugf("enterprise exit-node policy is waiting for routes: %v", err)
+		return
+	}
+
+	var selectedExitNodes []string
+	targetAvailable := false
+	for _, network := range response.GetRoutes() {
+		if network == nil || !isExitNodeRange(network.GetRange()) {
+			continue
+		}
+		if network.GetSelected() {
+			selectedExitNodes = append(selectedExitNodes, network.GetID())
+		}
+		if network.GetID() == policy.NetworkID {
+			targetAvailable = true
+		}
+	}
+
+	if policy.Mode == exitNodePinned && targetAvailable {
+		if len(selectedExitNodes) == 1 && selectedExitNodes[0] == policy.NetworkID {
+			return
+		}
+		_, err = p.raw.SelectNetworks(ctx, &proto.SelectNetworksRequest{
+			NetworkIDs: []string{policy.NetworkID},
+			Append:     true,
+		})
+		if err != nil {
+			log.Warnf("enterprise policy could not pin exit node %q: %v", policy.NetworkID, err)
+		}
+		return
+	}
+
+	if len(selectedExitNodes) > 0 {
+		if _, err := p.raw.DeselectNetworks(ctx, &proto.SelectNetworksRequest{NetworkIDs: selectedExitNodes}); err != nil {
+			log.Warnf("enterprise policy could not disable exit nodes: %v", err)
+			return
+		}
+	}
+	if policy.Mode == exitNodePinned && !targetAvailable {
+		log.Warnf("enterprise pinned exit node %q is not available; all exit nodes remain disabled", policy.NetworkID)
+	}
+}
+
+func isExitNodeRange(value string) bool {
+	for _, item := range strings.Split(value, ",") {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
+		if err == nil && prefix.Bits() == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *policyController) logFailure(err error) {
@@ -404,6 +599,20 @@ func (s *wrappedServer) effectiveMode() connectionMode {
 	return s.policy.mode(s.policy.now())
 }
 
+func (s *wrappedServer) effectiveControls() clientControls {
+	if s.policy == nil {
+		return strictControls()
+	}
+	return s.policy.controls(s.policy.now())
+}
+
+func (s *wrappedServer) effectiveExitNode() exitNodePolicy {
+	if s.policy == nil {
+		return exitNodePolicy{Mode: exitNodeDisabled}
+	}
+	return s.policy.exitNode(s.policy.now())
+}
+
 func (s *wrappedServer) Login(ctx context.Context, request *proto.LoginRequest) (*proto.LoginResponse, error) {
 	if request == nil {
 		request = &proto.LoginRequest{}
@@ -435,8 +644,11 @@ func (s *wrappedServer) Down(ctx context.Context, request *proto.DownRequest) (*
 	return s.LifecycleServer.Down(ctx, request)
 }
 
-func (s *wrappedServer) Logout(context.Context, *proto.LogoutRequest) (*proto.LogoutResponse, error) {
-	return nil, status.Error(codes.PermissionDenied, errLogoutDisabled)
+func (s *wrappedServer) Logout(ctx context.Context, request *proto.LogoutRequest) (*proto.LogoutResponse, error) {
+	if s.effectiveControls().Logout == controlDisabled {
+		return nil, status.Error(codes.PermissionDenied, errLogoutDisabled)
+	}
+	return s.LifecycleServer.Logout(ctx, request)
 }
 
 func (s *wrappedServer) GetConfig(ctx context.Context, request *proto.GetConfigRequest) (*proto.GetConfigResponse, error) {
@@ -456,11 +668,12 @@ func (s *wrappedServer) GetFeatures(ctx context.Context, request *proto.GetFeatu
 	if response == nil {
 		response = &proto.GetFeaturesResponse{}
 	}
-	managed := true
-	response.DisableProfiles = true
-	response.DisableUpdateSettings = true
-	response.DisableNetworks = true
-	response.DisableAdvancedView = &managed
+	controls := s.effectiveControls()
+	response.DisableProfiles = controls.Profiles == controlDisabled
+	response.DisableUpdateSettings = controls.Settings == controlDisabled
+	response.DisableNetworks = controls.Networks == controlDisabled
+	advancedViewDisabled := controls.AdvancedView == controlDisabled
+	response.DisableAdvancedView = &advancedViewDisabled
 	return response, nil
 }
 
@@ -468,54 +681,102 @@ func settingsDisabled() error {
 	return status.Error(codes.PermissionDenied, errSettingsDisabled)
 }
 
-func (s *wrappedServer) SetConfig(context.Context, *proto.SetConfigRequest) (*proto.SetConfigResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) SetConfig(ctx context.Context, request *proto.SetConfigRequest) (*proto.SetConfigResponse, error) {
+	if s.effectiveControls().Settings == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	if request == nil {
+		request = &proto.SetConfigRequest{}
+	}
+	lockedRequest := gproto.Clone(request).(*proto.SetConfigRequest)
+	lockedRequest.ManagementUrl = managementURL
+	lockedRequest.ProfileName = ""
+	lockedRequest.Username = ""
+	return s.LifecycleServer.SetConfig(ctx, lockedRequest)
 }
 
-func (s *wrappedServer) SelectNetworks(context.Context, *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) SelectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
+	controls := s.effectiveControls()
+	if controls.Networks == controlDisabled || s.effectiveExitNode().Mode != exitNodeUserControlled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.SelectNetworks(ctx, request)
 }
 
-func (s *wrappedServer) DeselectNetworks(context.Context, *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) DeselectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
+	controls := s.effectiveControls()
+	if controls.Networks == controlDisabled || s.effectiveExitNode().Mode != exitNodeUserControlled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.DeselectNetworks(ctx, request)
 }
 
-func (s *wrappedServer) SetLogLevel(context.Context, *proto.SetLogLevelRequest) (*proto.SetLogLevelResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) SetLogLevel(ctx context.Context, request *proto.SetLogLevelRequest) (*proto.SetLogLevelResponse, error) {
+	if s.effectiveControls().Settings == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.SetLogLevel(ctx, request)
 }
 
-func (s *wrappedServer) CleanState(context.Context, *proto.CleanStateRequest) (*proto.CleanStateResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) CleanState(ctx context.Context, request *proto.CleanStateRequest) (*proto.CleanStateResponse, error) {
+	if s.effectiveControls().Settings == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.CleanState(ctx, request)
 }
 
-func (s *wrappedServer) DeleteState(context.Context, *proto.DeleteStateRequest) (*proto.DeleteStateResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) DeleteState(ctx context.Context, request *proto.DeleteStateRequest) (*proto.DeleteStateResponse, error) {
+	if s.effectiveControls().Settings == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.DeleteState(ctx, request)
 }
 
-func (s *wrappedServer) SetSyncResponsePersistence(context.Context, *proto.SetSyncResponsePersistenceRequest) (*proto.SetSyncResponsePersistenceResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) SetSyncResponsePersistence(ctx context.Context, request *proto.SetSyncResponsePersistenceRequest) (*proto.SetSyncResponsePersistenceResponse, error) {
+	if s.effectiveControls().Settings == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.SetSyncResponsePersistence(ctx, request)
 }
 
-func (s *wrappedServer) SwitchProfile(context.Context, *proto.SwitchProfileRequest) (*proto.SwitchProfileResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) SwitchProfile(ctx context.Context, request *proto.SwitchProfileRequest) (*proto.SwitchProfileResponse, error) {
+	if s.effectiveControls().Profiles == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.SwitchProfile(ctx, request)
 }
 
-func (s *wrappedServer) AddProfile(context.Context, *proto.AddProfileRequest) (*proto.AddProfileResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) AddProfile(ctx context.Context, request *proto.AddProfileRequest) (*proto.AddProfileResponse, error) {
+	if s.effectiveControls().Profiles == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.AddProfile(ctx, request)
 }
 
-func (s *wrappedServer) RenameProfile(context.Context, *proto.RenameProfileRequest) (*proto.RenameProfileResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) RenameProfile(ctx context.Context, request *proto.RenameProfileRequest) (*proto.RenameProfileResponse, error) {
+	if s.effectiveControls().Profiles == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.RenameProfile(ctx, request)
 }
 
-func (s *wrappedServer) RemoveProfile(context.Context, *proto.RemoveProfileRequest) (*proto.RemoveProfileResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) RemoveProfile(ctx context.Context, request *proto.RemoveProfileRequest) (*proto.RemoveProfileResponse, error) {
+	if s.effectiveControls().Profiles == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.RemoveProfile(ctx, request)
 }
 
-func (s *wrappedServer) TriggerUpdate(context.Context, *proto.TriggerUpdateRequest) (*proto.TriggerUpdateResponse, error) {
-	return nil, settingsDisabled()
+func (s *wrappedServer) TriggerUpdate(ctx context.Context, request *proto.TriggerUpdateRequest) (*proto.TriggerUpdateResponse, error) {
+	if s.effectiveControls().ClientUpdates == controlDisabled {
+		return nil, settingsDisabled()
+	}
+	return s.LifecycleServer.TriggerUpdate(ctx, request)
 }
 
-func (s *wrappedServer) ExposeService(*proto.ExposeServiceRequest, proto.DaemonService_ExposeServiceServer) error {
-	return settingsDisabled()
+func (s *wrappedServer) ExposeService(request *proto.ExposeServiceRequest, stream proto.DaemonService_ExposeServiceServer) error {
+	if s.effectiveControls().Settings == controlDisabled {
+		return settingsDisabled()
+	}
+	return s.LifecycleServer.ExposeService(request, stream)
 }
