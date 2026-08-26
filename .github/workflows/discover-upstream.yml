@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   discover:
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 10
     steps:
       - name: Check out enterprise overlay
@@ -31,6 +31,7 @@ jobs:
 
       - name: Resolve and pin latest stable upstream release
         id: upstream
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/overlay.py discover --write-lock
@@ -75,7 +76,7 @@ jobs:
             echo "- Peeled commit: \`${UPSTREAM_COMMIT}\`"
             echo "- Release: ${UPSTREAM_RELEASE_URL}"
             echo
-            echo 'This PR is intentionally draft. Qualification must apply the enterprise patch stack, pass invariant tests, and build Windows and macOS candidates before merge.'
+          echo 'This PR is intentionally draft. Qualification must apply the enterprise patch stack, pass invariant tests, and build Windows candidates before merge.'
           } > "$body_file"
 
           gh pr create \

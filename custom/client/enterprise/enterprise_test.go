@@ -13,19 +13,25 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/netbirdio/netbird/client/internal"
 	"github.com/netbirdio/netbird/client/mdm"
 	"github.com/netbirdio/netbird/client/proto"
 )
 
 type fakeLifecycleServer struct {
 	proto.UnimplementedDaemonServiceServer
-	upCalls          int
-	downCalls        int
-	logoutCalls      int
-	features         *proto.GetFeaturesResponse
-	networks         []*proto.Network
-	selectRequests   []*proto.SelectNetworksRequest
-	deselectRequests []*proto.SelectNetworksRequest
+	upCalls           int
+	downCalls         int
+	logoutCalls       int
+	switchProfileCalls int
+	status            string
+	features          *proto.GetFeaturesResponse
+	config            *proto.GetConfigResponse
+	networks          []*proto.Network
+	loginRequests     []*proto.LoginRequest
+	selectRequests    []*proto.SelectNetworksRequest
+	deselectRequests  []*proto.SelectNetworksRequest
+	setConfigRequests []*proto.SetConfigRequest
 }
 
 func (*fakeLifecycleServer) Start() error {
@@ -47,6 +53,20 @@ func (f *fakeLifecycleServer) Logout(context.Context, *proto.LogoutRequest) (*pr
 	return &proto.LogoutResponse{}, nil
 }
 
+func (f *fakeLifecycleServer) Login(_ context.Context, request *proto.LoginRequest) (*proto.LoginResponse, error) {
+	f.loginRequests = append(f.loginRequests, request)
+	return &proto.LoginResponse{}, nil
+}
+
+func (f *fakeLifecycleServer) Status(context.Context, *proto.StatusRequest) (*proto.StatusResponse, error) {
+	return &proto.StatusResponse{Status: f.status}, nil
+}
+
+func (f *fakeLifecycleServer) SwitchProfile(context.Context, *proto.SwitchProfileRequest) (*proto.SwitchProfileResponse, error) {
+	f.switchProfileCalls++
+	return &proto.SwitchProfileResponse{}, nil
+}
+
 func (f *fakeLifecycleServer) ListNetworks(context.Context, *proto.ListNetworksRequest) (*proto.ListNetworksResponse, error) {
 	return &proto.ListNetworksResponse{Routes: f.networks}, nil
 }
@@ -66,6 +86,21 @@ func (f *fakeLifecycleServer) GetFeatures(context.Context, *proto.GetFeaturesReq
 		return &proto.GetFeaturesResponse{}, nil
 	}
 	return f.features, nil
+}
+
+func (f *fakeLifecycleServer) GetConfig(context.Context, *proto.GetConfigRequest) (*proto.GetConfigResponse, error) {
+	if f.config == nil {
+		return &proto.GetConfigResponse{}, nil
+	}
+	return f.config, nil
+}
+
+func (f *fakeLifecycleServer) SetConfig(_ context.Context, request *proto.SetConfigRequest) (*proto.SetConfigResponse, error) {
+	f.setConfigRequests = append(f.setConfigRequests, request)
+	if request.GetDisableAutoConnect() && f.config != nil {
+		f.config.DisableAutoConnect = true
+	}
+	return &proto.SetConfigResponse{}, nil
 }
 
 func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
@@ -93,8 +128,8 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 		if payload["peer_public_key"] != "test-peer-key" {
 			t.Errorf("peer_public_key = %v, want test-peer-key", payload["peer_public_key"])
 		}
-		if payload["schema_version"] != float64(3) {
-			t.Errorf("schema_version = %v, want 3", payload["schema_version"])
+		if payload["schema_version"] != float64(4) {
+			t.Errorf("schema_version = %v, want 4", payload["schema_version"])
 		}
 		if _, ok := payload["exit_node_state"]; !ok {
 			t.Error("request does not contain exit_node_state")
@@ -102,15 +137,15 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 
 		writer.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(writer).Encode(policyResponse{
-			SchemaVersion:   3,
-			Revision:        1,
-			PolicyID:        "test-policy",
-			ConnectionMode:  modeAdminDisabled,
-			IssuedAt:        fixedNow.Add(-time.Minute),
-			ValidUntil:      fixedNow.Add(time.Minute),
-			ReasonCode:      "TEST",
-			NetBirdControls: strictNetBirdControls(),
-			ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
+			SchemaVersion:      4,
+			Revision:           1,
+			PolicyID:           "test-policy",
+			IssuedAt:           fixedNow.Add(-time.Minute),
+			ValidUntil:         fixedNow.Add(time.Minute),
+			ReasonCode:         "TEST",
+			NetBirdControls:    strictNetBirdControls(),
+			EnterpriseControls: enterpriseControls{KeepConnected: true, DisableQuit: true},
+			ExitNode:            exitNodePolicy{Mode: exitNodeDisabled},
 		}); err != nil {
 			t.Fatalf("encode response: %v", err)
 		}
@@ -128,8 +163,8 @@ func TestPolicyPollUsesJSONAndIncludesSerialField(t *testing.T) {
 	if !requestReceived {
 		t.Fatal("policy server did not receive a request")
 	}
-	if got := controller.mode(fixedNow); got != modeAdminDisabled {
-		t.Fatalf("mode = %q, want %q", got, modeAdminDisabled)
+	if got := controller.enterpriseControls(fixedNow); !got.KeepConnected || !got.DisableQuit {
+		t.Fatalf("enterprise controls = %+v, want strict controls", got)
 	}
 	if policyPollInterval != 15*time.Second {
 		t.Fatalf("poll interval = %s, want 15s", policyPollInterval)
@@ -140,23 +175,23 @@ func TestPolicyIsFailClosedAndRejectsRollback(t *testing.T) {
 	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
 	controller := &policyController{now: func() time.Time { return fixedNow }}
 	valid := policyResponse{
-		SchemaVersion:   3,
-		Revision:        2,
-		PolicyID:        "support-window",
-		ConnectionMode:  modeUserControlled,
-		IssuedAt:        fixedNow.Add(-time.Minute),
-		ValidUntil:      fixedNow.Add(time.Minute),
-		NetBirdControls: strictNetBirdControls(),
-		ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
+		SchemaVersion:      4,
+		Revision:           2,
+		PolicyID:           "support-window",
+		IssuedAt:           fixedNow.Add(-time.Minute),
+		ValidUntil:         fixedNow.Add(time.Minute),
+		NetBirdControls:    strictNetBirdControls(),
+		EnterpriseControls: enterpriseControls{KeepConnected: false, DisableQuit: false},
+		ExitNode:            exitNodePolicy{Mode: exitNodeDisabled},
 	}
 	if err := controller.accept(valid, fixedNow); err != nil {
 		t.Fatalf("accept valid policy: %v", err)
 	}
-	if got := controller.mode(fixedNow); got != modeUserControlled {
-		t.Fatalf("mode = %q, want %q", got, modeUserControlled)
+	if got := controller.enterpriseControls(fixedNow); got.KeepConnected || got.DisableQuit {
+		t.Fatalf("enterprise controls = %+v, want valid relaxation", got)
 	}
-	if got := controller.mode(valid.ValidUntil); got != modeRequired {
-		t.Fatalf("expired mode = %q, want %q", got, modeRequired)
+	if got := controller.enterpriseControls(valid.ValidUntil); !got.KeepConnected || !got.DisableQuit {
+		t.Fatalf("expired controls = %+v, want strict controls", got)
 	}
 
 	rollback := valid
@@ -179,6 +214,9 @@ func TestWrapperRestrictsManagedOperations(t *testing.T) {
 	if _, err := wrapper.SetConfig(context.Background(), &proto.SetConfigRequest{}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("SetConfig error = %v, want PermissionDenied", err)
 	}
+	if _, err := wrapper.SwitchProfile(context.Background(), &proto.SwitchProfileRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("SwitchProfile error = %v, want PermissionDenied", err)
+	}
 	if raw.downCalls != 0 {
 		t.Fatalf("raw Down calls = %d, want 0", raw.downCalls)
 	}
@@ -193,21 +231,21 @@ func TestWrapperRestrictsManagedOperations(t *testing.T) {
 	}
 }
 
-func TestWrapperHonorsServerConnectionModes(t *testing.T) {
+func TestKeepConnectedControlsDisconnectAndReconnects(t *testing.T) {
 	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
 	raw := &fakeLifecycleServer{}
 	controller := &policyController{
 		raw: raw,
 		now: func() time.Time { return fixedNow },
 		snapshot: policyResponse{
-			SchemaVersion:   3,
-			Revision:        1,
-			PolicyID:        "connection-policy",
-			ConnectionMode:  modeUserControlled,
-			IssuedAt:        fixedNow.Add(-time.Minute),
-			ValidUntil:      fixedNow.Add(time.Minute),
-			NetBirdControls: strictNetBirdControls(),
-			ExitNode:        exitNodePolicy{Mode: exitNodeDisabled},
+			SchemaVersion:      4,
+			Revision:           1,
+			PolicyID:           "connection-policy",
+			IssuedAt:           fixedNow.Add(-time.Minute),
+			ValidUntil:         fixedNow.Add(time.Minute),
+			NetBirdControls:    strictNetBirdControls(),
+			EnterpriseControls: enterpriseControls{KeepConnected: false, DisableQuit: true},
+			ExitNode:            exitNodePolicy{Mode: exitNodeDisabled},
 		},
 		hasSnapshot: true,
 	}
@@ -220,12 +258,18 @@ func TestWrapperHonorsServerConnectionModes(t *testing.T) {
 		t.Fatalf("raw Down calls = %d, want 1", raw.downCalls)
 	}
 
-	controller.snapshot.ConnectionMode = modeAdminDisabled
-	if _, err := wrapper.Up(context.Background(), &proto.UpRequest{}); status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("Up in ADMIN_DISABLED error = %v, want PermissionDenied", err)
+	controller.snapshot.EnterpriseControls.KeepConnected = true
+	if _, err := wrapper.Down(context.Background(), &proto.DownRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("Down with keepConnected error = %v, want PermissionDenied", err)
 	}
-	if raw.upCalls != 0 {
-		t.Fatalf("raw Up calls = %d, want 0", raw.upCalls)
+	controller.reconcile(context.Background())
+	if raw.upCalls != 1 {
+		t.Fatalf("raw Up calls = %d, want reconnect", raw.upCalls)
+	}
+	raw.status = string(internal.StatusConnected)
+	controller.reconcile(context.Background())
+	if raw.upCalls != 1 {
+		t.Fatalf("raw Up calls = %d, want no reconnect while connected", raw.upCalls)
 	}
 }
 
@@ -256,6 +300,12 @@ func TestNativeControlsCanBeRelaxedOnlyByValidCurrentPolicy(t *testing.T) {
 	if _, err := wrapper.SelectNetworks(context.Background(), &proto.SelectNetworksRequest{}); err != nil {
 		t.Fatalf("SelectNetworks with USER_CONTROLLED exit node: %v", err)
 	}
+	if _, err := wrapper.SwitchProfile(context.Background(), &proto.SwitchProfileRequest{}); err != nil {
+		t.Fatalf("SwitchProfile when disableProfiles=false: %v", err)
+	}
+	if raw.switchProfileCalls != 1 {
+		t.Fatalf("raw SwitchProfile calls = %d, want 1", raw.switchProfileCalls)
+	}
 
 	controller.snapshot.ValidUntil = fixedNow
 	features, err = wrapper.GetFeatures(context.Background(), &proto.GetFeaturesRequest{})
@@ -264,6 +314,111 @@ func TestNativeControlsCanBeRelaxedOnlyByValidCurrentPolicy(t *testing.T) {
 	}
 	if !features.GetDisableProfiles() || !features.GetDisableNetworks() {
 		t.Fatalf("expired native controls did not fail closed: %+v", features)
+	}
+}
+
+func TestDisableAutoConnectIsAppliedAndReportedManaged(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	controls := strictNetBirdControls()
+	controls[mdm.KeyDisableAutoConnect] = true
+	raw := &fakeLifecycleServer{config: &proto.GetConfigResponse{DisableAutoConnect: false}}
+	controller := &policyController{
+		raw: raw,
+		now: func() time.Time { return fixedNow },
+		snapshot: policyResponse{
+			ValidUntil:        fixedNow.Add(time.Minute),
+			NetBirdControls:   controls,
+			EnterpriseControls: enterpriseControls{KeepConnected: false, DisableQuit: true},
+			ExitNode:          exitNodePolicy{Mode: exitNodeUserControlled},
+		},
+		hasSnapshot: true,
+	}
+	controller.reconcile(context.Background())
+	if len(raw.setConfigRequests) != 1 || raw.setConfigRequests[0].DisableAutoConnect == nil ||
+		!raw.setConfigRequests[0].GetDisableAutoConnect() {
+		t.Fatalf("SetConfig requests = %+v, want disableAutoConnect=true", raw.setConfigRequests)
+	}
+
+	wrapper := &wrappedServer{LifecycleServer: raw, policy: controller}
+	config, err := wrapper.GetConfig(context.Background(), &proto.GetConfigRequest{})
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	if !config.GetDisableAutoConnect() || !containsString(config.GetMDMManagedFields(), mdm.KeyDisableAutoConnect) ||
+		!containsString(config.GetMDMManagedFields(), "disableQuit") {
+		t.Fatalf("managed config was not projected: %+v", config)
+	}
+}
+
+func TestKeepConnectedRejectsDisableAutoConnectConflict(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	controls := strictNetBirdControls()
+	controls[mdm.KeyDisableAutoConnect] = true
+	candidate := policyResponse{
+		SchemaVersion:      4,
+		Revision:           1,
+		PolicyID:           "conflict",
+		IssuedAt:           fixedNow.Add(-time.Minute),
+		ValidUntil:         fixedNow.Add(time.Minute),
+		NetBirdControls:    controls,
+		EnterpriseControls: enterpriseControls{KeepConnected: true, DisableQuit: true},
+		ExitNode:           exitNodePolicy{Mode: exitNodeDisabled},
+	}
+	controller := &policyController{}
+	if err := controller.accept(candidate, fixedNow); err == nil {
+		t.Fatal("keepConnected + disableAutoConnect conflict was accepted")
+	}
+}
+
+func TestEnterpriseControlsJSONRequiresBothBooleans(t *testing.T) {
+	for _, body := range []string{
+		`{"keepConnected":true}`,
+		`{"disableQuit":true}`,
+		`{"keepConnected":true,"disableQuit":true,"unknown":false}`,
+	} {
+		var controls enterpriseControls
+		if err := json.Unmarshal([]byte(body), &controls); err == nil {
+			t.Fatalf("invalid enterpriseControls JSON was accepted: %s", body)
+		}
+	}
+}
+
+func TestManagementURLIsLockedOnLoginAndSettingsUpdate(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	controls := strictNetBirdControls()
+	controls[mdm.KeyDisableUpdateSettings] = false
+	raw := &fakeLifecycleServer{}
+	controller := &policyController{
+		now: func() time.Time { return fixedNow },
+		snapshot: policyResponse{
+			ValidUntil:         fixedNow.Add(time.Minute),
+			NetBirdControls:    controls,
+			EnterpriseControls: enterpriseControls{KeepConnected: false, DisableQuit: false},
+			ExitNode:           exitNodePolicy{Mode: exitNodeUserControlled},
+		},
+		hasSnapshot: true,
+	}
+	wrapper := &wrappedServer{LifecycleServer: raw, policy: controller}
+
+	if _, err := wrapper.Login(context.Background(), &proto.LoginRequest{
+		ManagementUrl: "https://attacker.invalid",
+	}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if len(raw.loginRequests) != 1 || raw.loginRequests[0].GetManagementUrl() != managementURL {
+		t.Fatalf("Login management URL = %+v, want %s", raw.loginRequests, managementURL)
+	}
+
+	disableAutoConnect := true
+	if _, err := wrapper.SetConfig(context.Background(), &proto.SetConfigRequest{
+		ManagementUrl:      "https://attacker.invalid",
+		DisableAutoConnect: &disableAutoConnect,
+	}); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if len(raw.setConfigRequests) != 1 || raw.setConfigRequests[0].GetManagementUrl() != managementURL ||
+		raw.setConfigRequests[0].GetDisableAutoConnect() {
+		t.Fatalf("locked SetConfig request = %+v", raw.setConfigRequests)
 	}
 }
 
@@ -298,6 +453,77 @@ func TestExitNodePolicyPinsAndDisablesOnlyDefaultRoutes(t *testing.T) {
 		raw.deselectRequests[0].GetNetworkIDs()[0] != "exit-a" {
 		t.Fatalf("disable request = %+v, want only exit-a", raw.deselectRequests)
 	}
+}
+
+func TestManagedExitNodeStillAllowsOrdinaryRouteSelection(t *testing.T) {
+	fixedNow := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	controls := strictNetBirdControls()
+	controls[mdm.KeyDisableNetworks] = false
+	raw := &fakeLifecycleServer{networks: []*proto.Network{
+		{ID: "exit-a", Range: "0.0.0.0/0"},
+		{ID: "corp", Range: "10.0.0.0/8"},
+	}}
+	controller := &policyController{
+		now: func() time.Time { return fixedNow },
+		snapshot: policyResponse{
+			ValidUntil:        fixedNow.Add(time.Minute),
+			NetBirdControls:   controls,
+			EnterpriseControls: enterpriseControls{KeepConnected: true, DisableQuit: true},
+			ExitNode:          exitNodePolicy{Mode: exitNodeDisabled},
+		},
+		hasSnapshot: true,
+	}
+	wrapper := &wrappedServer{LifecycleServer: raw, policy: controller}
+
+	if _, err := wrapper.SelectNetworks(context.Background(), &proto.SelectNetworksRequest{
+		NetworkIDs: []string{"corp"}, Append: true,
+	}); err != nil {
+		t.Fatalf("ordinary route selection: %v", err)
+	}
+	if _, err := wrapper.SelectNetworks(context.Background(), &proto.SelectNetworksRequest{
+		NetworkIDs: []string{"exit-a"}, Append: true,
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("exit-node selection error = %v, want PermissionDenied", err)
+	}
+	if len(raw.selectRequests) != 1 || raw.selectRequests[0].GetNetworkIDs()[0] != "corp" {
+		t.Fatalf("delegated route requests = %+v, want only corp", raw.selectRequests)
+	}
+}
+
+func TestForceDisconnectNotificationUsesJSONIdentity(t *testing.T) {
+	requestReceived := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestReceived = true
+		if request.URL.Path != "/force-disconnect" || request.Method != http.MethodPost {
+			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if _, ok := payload["system_serial_number"]; !ok || payload["peer_public_key"] != "test-peer-key" {
+			t.Errorf("force-disconnect identity missing: %+v", payload)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	controller := newPolicyController(&fakeLifecycleServer{}, "test-peer-key", nil)
+	controller.forceEndpoint = server.URL + "/force-disconnect"
+	controller.now = func() time.Time { return time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC) }
+	controller.notifyForceDisconnect()
+	if !requestReceived {
+		t.Fatal("force-disconnect request was not received")
+	}
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestExitNodePolicyRejectsInvalidCombinations(t *testing.T) {

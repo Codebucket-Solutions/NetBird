@@ -23,7 +23,7 @@ concurrency:
 jobs:
   preflight:
     name: Validate protected release gate
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 10
     outputs:
       release_tag: ${{ steps.gate.outputs.release_tag }}
@@ -41,6 +41,7 @@ jobs:
 
       - name: Enforce release configuration
         id: gate
+        shell: bash
         env:
           REQUESTED_REVISION: ${{ inputs.enterprise_revision }}
         run: >-
@@ -88,13 +89,16 @@ jobs:
           path: ${{ runner.temp }}/unsigned
 
       - name: Sign and verify Windows executables
+        shell: bash
         env:
           CSCA1_CERT: ${{ secrets.CSCA1_CERT }}
           CSCA1_KEY: ${{ secrets.CSCA1_KEY }}
-        run: >-
-          python scripts/sign_windows.py
-          --input-directory "${{ runner.temp }}/unsigned"
-          --output-directory "${{ runner.temp }}/signed-${{ matrix.arch }}"
+        run: |
+          set -euo pipefail
+          temp_dir="$(cygpath -u '${{ runner.temp }}')"
+          python scripts/sign_windows.py \
+            --input-directory "$temp_dir/unsigned" \
+            --output-directory "$temp_dir/signed-${{ matrix.arch }}"
 
       - name: Upload signed Windows candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -111,7 +115,7 @@ jobs:
       - preflight
       - qualify
       - sign-windows
-    runs-on: ubuntu-24.04
+    runs-on: windows-2022
     timeout-minutes: 20
     permissions:
       contents: write
@@ -133,24 +137,20 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Download qualified macOS candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: candidate-macos-*
-          path: release-assets
-          merge-multiple: true
-
       - name: Reconstruct and archive auditable source
+        shell: bash
         run: |
+          set -euo pipefail
+          temp_dir="$(cygpath -u '${{ runner.temp }}')"
           python scripts/overlay.py materialize \
-            --destination '${{ runner.temp }}/netbird-source' \
+            --destination "$temp_dir/netbird-source" \
             --require-enterprise-hook
-          git -C '${{ runner.temp }}/netbird-source' archive \
+          git -C "$temp_dir/netbird-source" archive \
             --format=tar.gz \
             --prefix='netbird-enterprise-source/' \
             --output="$PWD/release-assets/netbird-enterprise-source.tar.gz" \
             HEAD
-          cp '${{ runner.temp }}/netbird-source.provenance.json' './release-assets/source-provenance.json'
+          cp "$temp_dir/netbird-source.provenance.json" './release-assets/source-provenance.json'
 
       - name: Create aggregate checksums
         shell: bash
@@ -183,7 +183,7 @@ jobs:
             echo "Enterprise client candidate based on upstream ${UPSTREAM_TAG}."
             echo
             echo 'Windows executables are Authenticode-signed with the Codebucket private code-signing CA.'
-            echo 'This release remains a draft until macOS Developer ID signing and notarization complete.'
+            echo 'This is a Windows-only draft release; no macOS artifact is included.'
           } > "$notes_file"
 
           gh release create "$RELEASE_TAG" \

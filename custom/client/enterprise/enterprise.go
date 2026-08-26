@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 	gproto "google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/netbird/client/internal"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/mdm"
 	"github.com/netbirdio/netbird/client/proto"
@@ -37,9 +38,10 @@ import (
 const (
 	managementURL        = "https://api.netbird.internal.codebuckets.in"
 	policyURL            = "https://api.netbird.internal.codebuckets.in/client-policy"
+	forceDisconnectURL   = "https://api.netbird.internal.codebuckets.in/force-disconnect"
 	policyPollInterval   = 15 * time.Second
 	policyRequestTimeout = 5 * time.Second
-	enterpriseRevision   = "codebuckets.3"
+	enterpriseRevision   = "codebuckets.4"
 )
 
 // LifecycleServer is the narrow seam between NetBird and the enterprise
@@ -56,14 +58,9 @@ const (
 	policyTokenEnv     = "NB_ENTERPRISE_POLICY_TOKEN"
 )
 
-type connectionMode string
 type exitNodeMode string
 
 const (
-	modeRequired       connectionMode = "REQUIRED"
-	modeUserControlled connectionMode = "USER_CONTROLLED"
-	modeAdminDisabled  connectionMode = "ADMIN_DISABLED"
-
 	exitNodeDisabled       exitNodeMode = "DISABLED"
 	exitNodePinned         exitNodeMode = "PINNED"
 	exitNodeUserControlled exitNodeMode = "USER_CONTROLLED"
@@ -76,6 +73,34 @@ var supportedNetBirdControls = map[string]struct{}{
 	mdm.KeyDisableProfiles:       {},
 	mdm.KeyDisableNetworks:       {},
 	mdm.KeyDisableAdvancedView:   {},
+	mdm.KeyDisableAutoConnect:    {},
+}
+
+type enterpriseControls struct {
+	KeepConnected bool `json:"keepConnected"`
+	DisableQuit   bool `json:"disableQuit"`
+}
+
+func (c *enterpriseControls) UnmarshalJSON(data []byte) error {
+	type wireControls struct {
+		KeepConnected *bool `json:"keepConnected"`
+		DisableQuit   *bool `json:"disableQuit"`
+	}
+	var wire wireControls
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return err
+	}
+	if wire.KeepConnected == nil || wire.DisableQuit == nil {
+		return errors.New("enterpriseControls requires keepConnected and disableQuit")
+	}
+	c.KeepConnected = *wire.KeepConnected
+	c.DisableQuit = *wire.DisableQuit
+	return nil
 }
 
 type exitNodePolicy struct {
@@ -101,29 +126,42 @@ type exitNodeState struct {
 	SelectedNetworkIDs  []string `json:"selected_network_ids"`
 }
 
+type forceDisconnectRequest struct {
+	SchemaVersion      int       `json:"schema_version"`
+	PeerPublicKey      string    `json:"peer_public_key"`
+	SystemSerialNumber string    `json:"system_serial_number"`
+	Hostname           string    `json:"hostname"`
+	OS                 string    `json:"os"`
+	OSVersion          string    `json:"os_version"`
+	UpstreamVersion    string    `json:"upstream_version"`
+	EnterpriseRevision string    `json:"enterprise_revision"`
+	ReasonCode         string    `json:"reason_code"`
+	OccurredAt         time.Time `json:"occurred_at"`
+}
+
 type policyResponse struct {
-	SchemaVersion   int             `json:"schema_version"`
-	Revision        uint64          `json:"revision"`
-	PolicyID        string          `json:"policy_id"`
-	ConnectionMode  connectionMode  `json:"connection_mode"`
-	IssuedAt        time.Time       `json:"issued_at"`
-	ValidUntil      time.Time       `json:"valid_until"`
-	ReasonCode      string          `json:"reason_code"`
-	NetBirdControls netBirdControls `json:"netBirdControls"`
-	ExitNode         exitNodePolicy  `json:"exit_node"`
+	SchemaVersion      int                `json:"schema_version"`
+	Revision           uint64             `json:"revision"`
+	PolicyID           string             `json:"policy_id"`
+	IssuedAt           time.Time          `json:"issued_at"`
+	ValidUntil         time.Time          `json:"valid_until"`
+	ReasonCode         string             `json:"reason_code"`
+	NetBirdControls    netBirdControls    `json:"netBirdControls"`
+	EnterpriseControls enterpriseControls `json:"enterpriseControls"`
+	ExitNode            exitNodePolicy     `json:"exit_node"`
 }
 
 type policyController struct {
 	raw           LifecycleServer
 	peerPublicKey string
 	endpoint      string
+	forceEndpoint string
 	httpClient    *http.Client
 	now           func() time.Time
 
 	mu                sync.RWMutex
 	snapshot          policyResponse
 	hasSnapshot       bool
-	lastReconciled    connectionMode
 	lastFailureLogged time.Time
 }
 
@@ -138,6 +176,7 @@ func newPolicyController(raw LifecycleServer, peerPublicKey string, certificate 
 		raw:           raw,
 		peerPublicKey: peerPublicKey,
 		endpoint:      policyURL,
+		forceEndpoint: forceDisconnectURL,
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   policyRequestTimeout,
@@ -150,6 +189,7 @@ func newPolicyController(raw LifecycleServer, peerPublicKey string, certificate 
 }
 
 func (p *policyController) run(ctx context.Context) {
+	defer p.notifyForceDisconnect()
 	p.pollAndReconcile(ctx)
 	ticker := time.NewTicker(policyPollInterval)
 	defer ticker.Stop()
@@ -174,7 +214,7 @@ func (p *policyController) poll(ctx context.Context) error {
 	now := p.now()
 	info := system.GetInfo(ctx)
 	requestPayload := policyRequest{
-		SchemaVersion:         3,
+		SchemaVersion:         4,
 		PeerPublicKey:         p.peerPublicKey,
 		SystemSerialNumber:    normalizeSerial(info.SystemSerialNumber),
 		Hostname:              info.Hostname,
@@ -260,6 +300,50 @@ func (p *policyController) observeExitNodes(ctx context.Context) exitNodeState {
 	return state
 }
 
+func (p *policyController) notifyForceDisconnect() {
+	// The upstream service Stop path waits two seconds after cancelling rootCtx.
+	// Keep this best-effort notification inside that graceful shutdown window.
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	info := system.GetInfo(ctx)
+	payload := forceDisconnectRequest{
+		SchemaVersion:      1,
+		PeerPublicKey:      p.peerPublicKey,
+		SystemSerialNumber: normalizeSerial(info.SystemSerialNumber),
+		Hostname:           info.Hostname,
+		OS:                 info.GoOS,
+		OSVersion:          info.OSVersion,
+		UpstreamVersion:    version.NetbirdVersion(),
+		EnterpriseRevision: enterpriseRevision,
+		ReasonCode:         "CLIENT_SHUTDOWN",
+		OccurredAt:         p.now().UTC(),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Warnf("enterprise force-disconnect payload failed: %v", err)
+		return
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.forceEndpoint, bytes.NewReader(body))
+	if err != nil {
+		log.Warnf("enterprise force-disconnect request failed: %v", err)
+		return
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(os.Getenv(policyTokenEnv)); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response, err := p.httpClient.Do(request)
+	if err != nil {
+		log.Warnf("enterprise force-disconnect notification failed: %v", err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		log.Warnf("enterprise force-disconnect notification returned HTTP %d", response.StatusCode)
+	}
+}
+
 func ensureJSONEOF(decoder *json.Decoder) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
@@ -272,16 +356,11 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 }
 
 func (p *policyController) accept(candidate policyResponse, now time.Time) error {
-	if candidate.SchemaVersion != 3 || candidate.Revision == 0 || candidate.PolicyID == "" {
+	if candidate.SchemaVersion != 4 || candidate.Revision == 0 || candidate.PolicyID == "" {
 		return errors.New("missing or unsupported policy identity")
 	}
 	if len(candidate.PolicyID) > 256 || len(candidate.ReasonCode) > 256 {
 		return errors.New("policy metadata is too long")
-	}
-	if candidate.ConnectionMode != modeRequired &&
-		candidate.ConnectionMode != modeUserControlled &&
-		candidate.ConnectionMode != modeAdminDisabled {
-		return fmt.Errorf("unsupported connection mode %q", candidate.ConnectionMode)
 	}
 	if err := validateNetBirdControls(candidate.NetBirdControls); err != nil {
 		return err
@@ -294,8 +373,12 @@ func (p *policyController) accept(candidate policyResponse, now time.Time) error
 		!candidate.ValidUntil.After(candidate.IssuedAt) {
 		return errors.New("invalid policy validity window")
 	}
-	if candidate.ConnectionMode == modeUserControlled && candidate.ValidUntil.Sub(now) > maxRelaxationTTL {
-		return fmt.Errorf("USER_CONTROLLED exceeds the %s hard TTL", maxRelaxationTTL)
+	if candidate.EnterpriseControls.KeepConnected && candidate.NetBirdControls[mdm.KeyDisableAutoConnect] {
+		return errors.New("keepConnected conflicts with disableAutoConnect")
+	}
+	if (!candidate.EnterpriseControls.KeepConnected || !candidate.EnterpriseControls.DisableQuit) &&
+		candidate.ValidUntil.Sub(now) > maxRelaxationTTL {
+		return fmt.Errorf("enterprise control relaxation exceeds the %s hard TTL", maxRelaxationTTL)
 	}
 
 	p.mu.Lock()
@@ -345,22 +428,27 @@ func validateExitNode(policy exitNodePolicy) error {
 	return nil
 }
 
-func (p *policyController) mode(now time.Time) connectionMode {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if !p.hasSnapshot || !p.snapshot.ValidUntil.After(now) {
-		return modeRequired
-	}
-	return p.snapshot.ConnectionMode
-}
-
 func strictNetBirdControls() netBirdControls {
 	return netBirdControls{
 		mdm.KeyDisableUpdateSettings: true,
 		mdm.KeyDisableProfiles:       true,
 		mdm.KeyDisableNetworks:       true,
 		mdm.KeyDisableAdvancedView:   true,
+		mdm.KeyDisableAutoConnect:    false,
 	}
+}
+
+func strictEnterpriseControls() enterpriseControls {
+	return enterpriseControls{KeepConnected: true, DisableQuit: true}
+}
+
+func (p *policyController) enterpriseControls(now time.Time) enterpriseControls {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.hasSnapshot || !p.snapshot.ValidUntil.After(now) {
+		return strictEnterpriseControls()
+	}
+	return p.snapshot.EnterpriseControls
 }
 
 func (p *policyController) netBirdControls(now time.Time) netBirdControls {
@@ -395,36 +483,37 @@ func (p *policyController) currentRevision() uint64 {
 }
 
 func (p *policyController) reconcile(parent context.Context) {
-	mode := p.mode(p.now())
-	p.mu.RLock()
-	alreadyReconciled := mode == p.lastReconciled
-	p.mu.RUnlock()
+	controls := p.enterpriseControls(p.now())
 
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	if !alreadyReconciled {
-		switch mode {
-		case modeRequired:
-			if _, err := p.raw.Up(ctx, &proto.UpRequest{Async: true}); err != nil {
-				log.Warnf("enterprise policy could not converge to REQUIRED: %v", err)
-				return
-			}
-		case modeAdminDisabled:
-			if _, err := p.raw.Down(ctx, &proto.DownRequest{}); err != nil {
-				log.Warnf("enterprise policy could not converge to ADMIN_DISABLED: %v", err)
-				return
-			}
-		case modeUserControlled:
-			// A valid, short-lived relaxation preserves the user's current intent.
+	if controls.KeepConnected && !p.isConnectedOrConnecting(ctx) {
+		if _, err := p.raw.Up(ctx, &proto.UpRequest{Async: true}); err != nil {
+			log.Warnf("enterprise policy could not converge to keepConnected: %v", err)
 		}
-
-		p.mu.Lock()
-		p.lastReconciled = mode
-		p.mu.Unlock()
 	}
 
-	if mode != modeAdminDisabled {
-		p.reconcileExitNode(ctx)
+	p.reconcileDisableAutoConnect(ctx)
+	p.reconcileExitNode(ctx)
+}
+
+func (p *policyController) isConnectedOrConnecting(ctx context.Context) bool {
+	response, err := p.raw.Status(ctx, &proto.StatusRequest{})
+	if err != nil || response == nil {
+		return false
+	}
+	return response.GetStatus() == string(internal.StatusConnected) ||
+		response.GetStatus() == string(internal.StatusConnecting)
+}
+
+func (p *policyController) reconcileDisableAutoConnect(ctx context.Context) {
+	desired := p.netBirdControls(p.now())[mdm.KeyDisableAutoConnect]
+	config, err := p.raw.GetConfig(ctx, &proto.GetConfigRequest{})
+	if err != nil || config == nil || config.GetDisableAutoConnect() == desired {
+		return
+	}
+	if _, err := p.raw.SetConfig(ctx, &proto.SetConfigRequest{DisableAutoConnect: &desired}); err != nil {
+		log.Warnf("enterprise policy could not apply disableAutoConnect=%t: %v", desired, err)
 	}
 }
 
@@ -511,7 +600,6 @@ func normalizeSerial(value string) string {
 
 const (
 	errDisconnectDisabled = "ENTERPRISE_DISCONNECT_DISABLED"
-	errConnectDisabled    = "ENTERPRISE_CONNECT_DISABLED"
 	errLogoutDisabled     = "ENTERPRISE_LOGOUT_DISABLED"
 	errSettingsDisabled   = "ENTERPRISE_SETTINGS_DISABLED"
 )
@@ -587,11 +675,11 @@ func enforceConfiguration(configPath string) (string, *tls.Certificate, error) {
 	return privateKey.PublicKey().String(), config.ClientCertKeyPair, nil
 }
 
-func (s *wrappedServer) effectiveMode() connectionMode {
+func (s *wrappedServer) effectiveEnterpriseControls() enterpriseControls {
 	if s.policy == nil {
-		return modeRequired
+		return strictEnterpriseControls()
 	}
-	return s.policy.mode(s.policy.now())
+	return s.policy.enterpriseControls(s.policy.now())
 }
 
 func (s *wrappedServer) netBirdControl(key string) bool {
@@ -620,9 +708,6 @@ func (s *wrappedServer) Login(ctx context.Context, request *proto.LoginRequest) 
 }
 
 func (s *wrappedServer) Up(ctx context.Context, request *proto.UpRequest) (*proto.UpResponse, error) {
-	if s.effectiveMode() == modeAdminDisabled {
-		return nil, status.Error(codes.PermissionDenied, errConnectDisabled)
-	}
 	if request == nil {
 		request = &proto.UpRequest{}
 	}
@@ -633,7 +718,7 @@ func (s *wrappedServer) Up(ctx context.Context, request *proto.UpRequest) (*prot
 }
 
 func (s *wrappedServer) Down(ctx context.Context, request *proto.DownRequest) (*proto.DownResponse, error) {
-	if s.effectiveMode() == modeRequired {
+	if s.effectiveEnterpriseControls().KeepConnected {
 		return nil, status.Error(codes.PermissionDenied, errDisconnectDisabled)
 	}
 	return s.LifecycleServer.Down(ctx, request)
@@ -647,7 +732,8 @@ func (s *wrappedServer) GetConfig(ctx context.Context, request *proto.GetConfigR
 	response, err := s.LifecycleServer.GetConfig(ctx, request)
 	if err == nil && response != nil {
 		response.ManagementUrl = managementURL
-		response.DisableAutoConnect = false
+		response.DisableAutoConnect = s.netBirdControl(mdm.KeyDisableAutoConnect)
+		response.MDMManagedFields = s.enterpriseManagedFields(response.GetMDMManagedFields())
 	}
 	return response, err
 }
@@ -686,21 +772,74 @@ func (s *wrappedServer) SetConfig(ctx context.Context, request *proto.SetConfigR
 	lockedRequest.ManagementUrl = managementURL
 	lockedRequest.ProfileName = ""
 	lockedRequest.Username = ""
+	disableAutoConnect := s.netBirdControl(mdm.KeyDisableAutoConnect)
+	lockedRequest.DisableAutoConnect = &disableAutoConnect
 	return s.LifecycleServer.SetConfig(ctx, lockedRequest)
 }
 
+func (s *wrappedServer) enterpriseManagedFields(existing []string) []string {
+	set := make(map[string]struct{}, len(existing)+len(supportedNetBirdControls)+2)
+	for _, key := range existing {
+		set[key] = struct{}{}
+	}
+	set[mdm.KeyManagementURL] = struct{}{}
+	for key := range supportedNetBirdControls {
+		set[key] = struct{}{}
+	}
+	if s.effectiveEnterpriseControls().DisableQuit {
+		set["disableQuit"] = struct{}{}
+	}
+	managed := make([]string, 0, len(set))
+	for key := range set {
+		managed = append(managed, key)
+	}
+	sort.Strings(managed)
+	return managed
+}
+
 func (s *wrappedServer) SelectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	if s.netBirdControl(mdm.KeyDisableNetworks) || s.effectiveExitNode().Mode != exitNodeUserControlled {
+	if s.netBirdControl(mdm.KeyDisableNetworks) {
 		return nil, settingsDisabled()
+	}
+	if err := s.rejectManagedExitNodeMutation(ctx, request, true); err != nil {
+		return nil, err
 	}
 	return s.LifecycleServer.SelectNetworks(ctx, request)
 }
 
 func (s *wrappedServer) DeselectNetworks(ctx context.Context, request *proto.SelectNetworksRequest) (*proto.SelectNetworksResponse, error) {
-	if s.netBirdControl(mdm.KeyDisableNetworks) || s.effectiveExitNode().Mode != exitNodeUserControlled {
+	if s.netBirdControl(mdm.KeyDisableNetworks) {
 		return nil, settingsDisabled()
 	}
+	if err := s.rejectManagedExitNodeMutation(ctx, request, false); err != nil {
+		return nil, err
+	}
 	return s.LifecycleServer.DeselectNetworks(ctx, request)
+}
+
+func (s *wrappedServer) rejectManagedExitNodeMutation(ctx context.Context, request *proto.SelectNetworksRequest, selecting bool) error {
+	if s.effectiveExitNode().Mode == exitNodeUserControlled {
+		return nil
+	}
+	if request == nil || request.GetAll() || (selecting && !request.GetAppend()) {
+		return settingsDisabled()
+	}
+	networks, err := s.LifecycleServer.ListNetworks(ctx, &proto.ListNetworksRequest{})
+	if err != nil {
+		return settingsDisabled()
+	}
+	exitIDs := make(map[string]struct{})
+	for _, network := range networks.GetRoutes() {
+		if network != nil && isExitNodeRange(network.GetRange()) {
+			exitIDs[network.GetID()] = struct{}{}
+		}
+	}
+	for _, id := range request.GetNetworkIDs() {
+		if _, isExitNode := exitIDs[id]; isExitNode {
+			return settingsDisabled()
+		}
+	}
+	return nil
 }
 
 func (s *wrappedServer) SetLogLevel(ctx context.Context, request *proto.SetLogLevelRequest) (*proto.SetLogLevelResponse, error) {

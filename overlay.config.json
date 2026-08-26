@@ -1,16 +1,19 @@
 {
   "schema_version": 1,
   "product_name": "CodeBuckets NetBird Enterprise",
-  "enterprise_revision": 3,
+  "enterprise_revision": 4,
   "release_enabled": false,
   "require_enterprise_hook": true,
   "allow_ui_patch": false,
   "management_url": "https://api.netbird.internal.codebuckets.in",
   "policy_url": "https://api.netbird.internal.codebuckets.in/client-policy",
   "policy_poll_interval_seconds": 15,
-  "policy_schema_version": 3,
+  "policy_schema_version": 4,
   "allowed_upstream_path_patterns": [
     "client/enterprise/**",
-    "client/cmd/service_controller.go"
+    "client/cmd/service_controller.go",
+    "client/ui/enterprise_*.go",
+    "client/ui/services/enterprise_*.go",
+    "client/ui/tray.go"
   ]
 }

@@ -28,53 +28,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Reconstruct, verify, and test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Check out enterprise overlay
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13'
-
-      - name: Reconstruct locked source
-        run: python scripts/overlay.py materialize --destination "${{ runner.temp }}/netbird-source" --require-enterprise-hook
-
-      - name: Set up Go from locked source
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: ${{ runner.temp }}/netbird-source/go.mod
-          cache: false
-
-      - name: Test daemon control surface
-        working-directory: ${{ runner.temp }}/netbird-source
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test -tags enterprise ./client/enterprise/...
-          go test -run '^$' -tags enterprise ./client/cmd
-          go test -run '^$' ./client/cmd
-
-      - name: Verify generated source remains clean
-        run: python scripts/overlay.py verify --source "${{ runner.temp }}/netbird-source" --require-enterprise-hook
-
-      - name: Upload source provenance
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: source-provenance
-          path: ${{ runner.temp }}/netbird-source.provenance.json
-          if-no-files-found: error
-          retention-days: 14
-
   windows:
     name: Windows ${{ matrix.arch }} candidate
-    needs: verify
     runs-on: windows-2022
     timeout-minutes: 45
     strategy:
@@ -95,7 +50,13 @@ jobs:
           python-version: '3.13'
 
       - name: Reconstruct locked source
-        run: python scripts/overlay.py materialize --destination "${{ runner.temp }}\netbird-source" --require-enterprise-hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp_dir="$(cygpath -u '${{ runner.temp }}')"
+          python scripts/overlay.py materialize \
+            --destination "$temp_dir/netbird-source" \
+            --require-enterprise-hook
 
       - name: Set up Go from locked source
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -114,91 +75,16 @@ jobs:
           version: '11.4.0'
           run_install: false
 
-      - name: Install Wails CLI matching the locked module graph
+      - name: Test enterprise controls
+        if: matrix.arch == 'amd64'
         working-directory: ${{ runner.temp }}/netbird-source
-        shell: pwsh
+        shell: bash
         run: |
-          $wailsVersion = go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3
-          if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve Wails version' }
-          go install "github.com/wailsapp/wails/v3/cmd/wails3@$wailsVersion"
-          if ($LASTEXITCODE -ne 0) { throw 'Unable to install Wails CLI' }
-
-      - name: Build daemon and UI
-        working-directory: ${{ runner.temp }}/netbird-source
-        shell: pwsh
-        env:
-          TARGET_ARCH: ${{ matrix.arch }}
-        run: |
-          $output = Join-Path $PWD "enterprise-dist/windows-$env:TARGET_ARCH"
-          New-Item -ItemType Directory -Path $output -Force | Out-Null
-
-          $env:GOOS = 'windows'
-          $env:GOARCH = $env:TARGET_ARCH
-          $env:CGO_ENABLED = '0'
-          go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' -o (Join-Path $output 'netbird.exe') ./client
-          if ($LASTEXITCODE -ne 0) { throw 'Daemon build failed' }
-
-          Push-Location client/ui
-          try {
-            wails3 task windows:build "ARCH=$env:TARGET_ARCH" 'EXTRA_TAGS=enterprise'
-            if ($LASTEXITCODE -ne 0) { throw 'Wails UI build failed' }
-          }
-          finally {
-            Pop-Location
-          }
-          Copy-Item -LiteralPath 'client/ui/bin/netbird-ui.exe' -Destination (Join-Path $output 'netbird-ui.exe')
-          Copy-Item -LiteralPath '${{ runner.temp }}\netbird-source.provenance.json' -Destination (Join-Path $output 'provenance.json')
-
-          $archive = Join-Path $PWD "enterprise-dist/netbird-enterprise-windows-$env:TARGET_ARCH.zip"
-          Compress-Archive -Path (Join-Path $output '*') -DestinationPath $archive
-          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $([System.IO.Path]::GetFileName($archive))" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
-
-      - name: Upload Windows candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: candidate-windows-${{ matrix.arch }}
-          path: |
-            ${{ runner.temp }}/netbird-source/enterprise-dist/*.zip
-            ${{ runner.temp }}/netbird-source/enterprise-dist/*.sha256
-          if-no-files-found: error
-          retention-days: 14
-
-  macos:
-    name: macOS universal candidate
-    needs: verify
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - name: Check out enterprise overlay
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13'
-
-      - name: Reconstruct locked source
-        run: python scripts/overlay.py materialize --destination "${{ runner.temp }}/netbird-source" --require-enterprise-hook
-
-      - name: Set up Go from locked source
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: ${{ runner.temp }}/netbird-source/go.mod
-          cache: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '22'
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          version: '11.4.0'
-          run_install: false
+          set -euo pipefail
+          go test -tags enterprise ./client/enterprise/...
+          go test -tags enterprise ./client/ui/services
+          go test -run '^$' -tags enterprise ./client/cmd
+          go test -run '^$' ./client/cmd
 
       - name: Install Wails CLI matching the locked module graph
         working-directory: ${{ runner.temp }}/netbird-source
@@ -208,44 +94,35 @@ jobs:
           wails_version="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)"
           go install "github.com/wailsapp/wails/v3/cmd/wails3@${wails_version}"
 
-      - name: Build universal daemon and app bundle
+      - name: Build daemon and UI
         working-directory: ${{ runner.temp }}/netbird-source
         shell: bash
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          output="$PWD/enterprise-dist/macos-universal"
+          output="$PWD/enterprise-dist/windows-${TARGET_ARCH}"
           mkdir -p "$output"
 
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 \
-            go build -trimpath -tags enterprise -o "$output/netbird-amd64" ./client
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
-            go build -trimpath -tags enterprise -o "$output/netbird-arm64" ./client
-          lipo -create -output "$output/netbird" "$output/netbird-amd64" "$output/netbird-arm64"
-          rm "$output/netbird-amd64" "$output/netbird-arm64"
+          CGO_ENABLED=0 GOOS=windows GOARCH="$TARGET_ARCH" \
+            go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' -o "$output/netbird.exe" ./client
 
           (
             cd client/ui
-            # The upstream universal task starts both native builds concurrently.
-            # Both branches regenerate frontend/dist, so one Go embed can observe
-            # the directory while the other branch is replacing it. Build the
-            # architectures sequentially, then perform the same lipo/package steps.
-            wails3 task darwin:build ARCH=amd64 OUTPUT=bin/netbird-ui-amd64 EXTRA_TAGS=enterprise
-            wails3 task darwin:build ARCH=arm64 OUTPUT=bin/netbird-ui-arm64 EXTRA_TAGS=enterprise
-            lipo -create -output bin/netbird-ui bin/netbird-ui-amd64 bin/netbird-ui-arm64
-            rm bin/netbird-ui-amd64 bin/netbird-ui-arm64
-            wails3 task darwin:create:app:bundle
+            wails3 task windows:build "ARCH=${TARGET_ARCH}" 'EXTRA_TAGS=enterprise'
           )
-          cp -R client/ui/bin/netbird-ui.app "$output/"
-          cp '${{ runner.temp }}/netbird-source.provenance.json' "$output/provenance.json"
+          cp client/ui/bin/netbird-ui.exe "$output/netbird-ui.exe"
+          temp_dir="$(cygpath -u '${{ runner.temp }}')"
+          cp "$temp_dir/netbird-source.provenance.json" "$output/provenance.json"
 
-          archive="$PWD/enterprise-dist/netbird-enterprise-macos-universal.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$output" "$archive"
-          shasum -a 256 "$archive" | sed "s#  .*/#  #" > "$archive.sha256"
+          archive="$PWD/enterprise-dist/netbird-enterprise-windows-${TARGET_ARCH}.zip"
+          python -m zipfile -c "$archive" "$output"
+          python -c 'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); pathlib.Path(str(p)+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n", encoding="ascii")' "$archive"
 
-      - name: Upload macOS candidate
+      - name: Upload Windows candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: candidate-macos-universal
+          name: candidate-windows-${{ matrix.arch }}
           path: |
             ${{ runner.temp }}/netbird-source/enterprise-dist/*.zip
             ${{ runner.temp }}/netbird-source/enterprise-dist/*.sha256

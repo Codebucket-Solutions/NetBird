@@ -23,8 +23,15 @@ STABLE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 PATCH_HASH = re.compile(r"^([0-9a-fA-F]{64})  (.+)$")
 PATCH_DIFF = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
-ENTERPRISE_HOOK_PATH = "client/cmd/service_controller.go"
-CUSTOM_SOURCE_PREFIX = ("client", "enterprise")
+ENTERPRISE_HOOK_PATHS = {
+    "client/cmd/service_controller.go",
+    "client/ui/tray.go",
+}
+CUSTOM_SOURCE_PATTERNS = (
+    "client/enterprise/**",
+    "client/ui/enterprise_*.go",
+    "client/ui/services/enterprise_*.go",
+)
 
 
 def run(
@@ -314,6 +321,12 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
         hook_count = len(re.findall(r"enterprise\.Wrap\s*\(", controller))
         if hook_count != 1:
             raise RuntimeError(f"expected exactly one enterprise.Wrap call; found {hook_count}")
+        tray = (source / "client" / "ui" / "tray.go").read_text(encoding="utf-8")
+        quit_hook_count = len(re.findall(r"t\.enterpriseQuitDisabled\s*\(", tray))
+        if quit_hook_count != 1:
+            raise RuntimeError(
+                f"expected exactly one enterprise quit guard; found {quit_hook_count}"
+            )
         enterprise_text = "\n".join(path.read_text(encoding="utf-8") for path in enterprise.rglob("*.go"))
         for required in (config["management_url"], config["policy_url"], "system_serial_number"):
             if str(required) not in enterprise_text:
@@ -372,9 +385,10 @@ def verify_patch_stack(patch_dir: Path) -> list[str]:
         if not diff_paths:
             raise RuntimeError(f"patch contains no file diff: {name}")
         for before, after in diff_paths:
-            if before != ENTERPRISE_HOOK_PATH or after != ENTERPRISE_HOOK_PATH:
+            if before != after or before not in ENTERPRISE_HOOK_PATHS:
                 raise RuntimeError(
-                    f"patch modifies a path other than the enterprise hook: {name}: {before} -> {after}"
+                    f"patch modifies a path other than an approved enterprise hook: "
+                    f"{name}: {before} -> {after}"
                 )
     return entries
 
@@ -401,8 +415,8 @@ def custom_source_inventory(
             continue
         relative = source.relative_to(custom_root)
         normalized = relative.as_posix()
-        if relative.parts[: len(CUSTOM_SOURCE_PREFIX)] != CUSTOM_SOURCE_PREFIX:
-            raise RuntimeError(f"custom source must live under client/enterprise: {normalized}")
+        if not any(fnmatch.fnmatchcase(normalized, pattern) for pattern in CUSTOM_SOURCE_PATTERNS):
+            raise RuntimeError(f"custom source path is not enterprise-owned: {normalized}")
         if not any(fnmatch.fnmatchcase(normalized, pattern) for pattern in allowed_patterns):
             raise RuntimeError(f"custom source path is outside the allow-list: {normalized}")
         content = source.read_bytes()
@@ -536,31 +550,52 @@ def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
     custom_source = source / "client" / "enterprise"
     if not custom_source.is_dir():
         raise RuntimeError("development source is missing client/enterprise")
-    custom_output = output / "custom" / "client" / "enterprise"
-    custom_output.parent.mkdir(parents=True)
-    shutil.copytree(custom_source, custom_output)
+    custom_output = output / "custom"
+    custom_files = [
+        path
+        for path in source.rglob("*")
+        if path.is_file()
+        and any(
+            fnmatch.fnmatchcase(path.relative_to(source).as_posix(), pattern)
+            for pattern in CUSTOM_SOURCE_PATTERNS
+        )
+    ]
+    for custom_file in sorted(custom_files):
+        relative = custom_file.relative_to(source)
+        target = custom_output / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(custom_file, target)
 
     patch_output = output / "patches"
     patch_output.mkdir(parents=True)
-    patch_name = "0001-enterprise-enforce-managed-client-policy.patch"
-    hook_diff = run(
-        "git",
-        "diff",
-        "--binary",
-        "--full-index",
-        f"{base}..HEAD",
-        "--",
-        "client/cmd/service_controller.go",
-        cwd=source,
-    ).stdout
-    if not hook_diff.strip():
-        raise RuntimeError("development source has no enterprise hook change")
-    patch_path = patch_output / patch_name
-    patch_path.write_text(hook_diff, encoding="utf-8", newline="\n")
-    (patch_output / "series").write_text(patch_name + "\n", encoding="utf-8", newline="\n")
-    patch_digest = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+    patch_specs = (
+        ("0001-enterprise-enforce-managed-client-policy.patch", "client/cmd/service_controller.go"),
+        ("0002-enterprise-guard-ui-quit.patch", "client/ui/tray.go"),
+    )
+    manifest_lines: list[str] = []
+    for patch_name, hook_path in patch_specs:
+        hook_diff = run(
+            "git",
+            "diff",
+            "--binary",
+            "--full-index",
+            f"{base}..HEAD",
+            "--",
+            hook_path,
+            cwd=source,
+        ).stdout
+        if not hook_diff.strip():
+            raise RuntimeError(f"development source has no enterprise hook change: {hook_path}")
+        patch_path = patch_output / patch_name
+        patch_path.write_text(hook_diff, encoding="utf-8", newline="\n")
+        manifest_lines.append(f"{hashlib.sha256(patch_path.read_bytes()).hexdigest()}  {patch_name}")
+    (patch_output / "series").write_text(
+        "\n".join(name for name, _ in patch_specs) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     (patch_output / "manifest.sha256").write_text(
-        f"{patch_digest}  {patch_name}\n",
+        "\n".join(manifest_lines) + "\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -570,7 +605,7 @@ def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
             "base_commit": base,
             "source_head": run("git", "rev-parse", "HEAD", cwd=source).stdout.strip(),
             "output_directory": str(output),
-            "patch_file": patch_name,
+            "patch_files": [name for name, _ in patch_specs],
             "custom_file_count": len([path for path in custom_output.rglob("*") if path.is_file()]),
         }
     )

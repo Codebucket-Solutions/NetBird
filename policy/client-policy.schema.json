@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://api.netbird.internal.codebuckets.in/schemas/client-policy-v3.json",
+  "$id": "https://api.netbird.internal.codebuckets.in/schemas/client-policy-v4.json",
   "title": "CodeBuckets NetBird client policy response",
   "description": "Authoritative response returned by POST /client-policy. Unknown fields are rejected by the client.",
   "type": "object",
@@ -9,7 +9,7 @@
     "schema_version",
     "revision",
     "policy_id",
-    "connection_mode",
+    "enterpriseControls",
     "issued_at",
     "valid_until",
     "reason_code",
@@ -29,12 +29,22 @@
       "minLength": 1,
       "maxLength": 256
     },
-    "connection_mode": {
-      "enum": [
-        "REQUIRED",
-        "USER_CONTROLLED",
-        "ADMIN_DISABLED"
-      ]
+    "enterpriseControls": {
+      "type": "object",
+      "description": "Enterprise-only controls enforced by the daemon and desktop UI.",
+      "additionalProperties": false,
+      "required": [
+        "keepConnected",
+        "disableQuit"
+      ],
+      "properties": {
+        "keepConnected": {
+          "type": "boolean"
+        },
+        "disableQuit": {
+          "type": "boolean"
+        }
+      }
     },
     "issued_at": {
       "type": "string",
@@ -56,7 +66,8 @@
           "disableUpdateSettings",
           "disableProfiles",
           "disableNetworks",
-          "disableAdvancedView"
+          "disableAdvancedView",
+          "disableAutoConnect"
         ]
       },
       "additionalProperties": {
@@ -123,7 +134,7 @@
       ],
       "properties": {
         "schema_version": {
-          "const": 3
+          "const": 4
         },
         "peer_public_key": {
           "type": "string"
@@ -179,17 +190,77 @@
           }
         }
       }
+    },
+    "forceDisconnectRequest": {
+      "type": "object",
+      "description": "Best-effort POST body sent to /force-disconnect during graceful daemon/service shutdown.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "peer_public_key",
+        "system_serial_number",
+        "hostname",
+        "os",
+        "os_version",
+        "upstream_version",
+        "enterprise_revision",
+        "reason_code",
+        "occurred_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "peer_public_key": {
+          "type": "string"
+        },
+        "system_serial_number": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "os": {
+          "enum": [
+            "windows",
+            "darwin"
+          ]
+        },
+        "os_version": {
+          "type": "string"
+        },
+        "upstream_version": {
+          "type": "string"
+        },
+        "enterprise_revision": {
+          "type": "string"
+        },
+        "reason_code": {
+          "const": "CLIENT_SHUTDOWN"
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
     }
   },
   "x-request-schema": {
     "$ref": "#/$defs/policyRequest"
   },
+  "x-force-disconnect-request-schema": {
+    "$ref": "#/$defs/forceDisconnectRequest"
+  },
   "examples": [
     {
-      "schema_version": 3,
+      "schema_version": 4,
       "revision": 43,
       "policy_id": "account-default",
-      "connection_mode": "REQUIRED",
+      "enterpriseControls": {
+        "keepConnected": true,
+        "disableQuit": true
+      },
       "issued_at": "2026-08-27T10:00:00Z",
       "valid_until": "2026-08-27T10:05:00Z",
       "reason_code": "ENTERPRISE_ALWAYS_ON",
@@ -197,7 +268,8 @@
         "disableUpdateSettings": true,
         "disableProfiles": true,
         "disableNetworks": true,
-        "disableAdvancedView": true
+        "disableAdvancedView": true,
+        "disableAutoConnect": false
       },
       "exit_node": {
         "mode": "PINNED",
@@ -299,8 +371,8 @@
       "value_type": "boolean",
       "category": "configuration",
       "support": "enforced",
-      "api_mapping": "connection_mode",
-      "notes": "The enterprise wrapper forces auto-connect on; REQUIRED/USER_CONTROLLED/ADMIN_DISABLED is the authoritative remote model."
+      "api_mapping": "netBirdControls.disableAutoConnect",
+      "notes": "Applied to daemon configuration every poll. A response combining true with enterpriseControls.keepConnected=true is rejected as contradictory."
     },
     {
       "key": "disableAutostart",
@@ -361,6 +433,22 @@
       "category": "configuration",
       "support": "enforced",
       "api_mapping": null
+    },
+    {
+      "key": "keepConnected",
+      "value_type": "boolean",
+      "category": "restriction",
+      "support": "enterprise",
+      "api_mapping": "enterpriseControls.keepConnected",
+      "notes": "When true, Down is denied and the 15-second reconciler calls Up whenever daemon status is neither Connected nor Connecting."
+    },
+    {
+      "key": "disableQuit",
+      "value_type": "boolean",
+      "category": "restriction",
+      "support": "enterprise",
+      "api_mapping": "enterpriseControls.disableQuit",
+      "notes": "When true, the desktop tray Quit action is denied with a visible error. Policy lookup failure is fail-closed."
     },
     {
       "key": "logout",
