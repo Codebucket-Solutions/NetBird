@@ -31,6 +31,12 @@ support `PINNED`, `DISABLED`, and `USER_CONTROLLED`; strict behavior is used whe
 no valid policy is available. Qualification compares the JSON key allow-list,
 the Go enforcement registry, and upstream MDM constants so they cannot drift.
 
+The NetBird management plane remains fixed at
+`https://api.netbird.internal.codebuckets.in`. The independent enterprise
+policy plane is fixed at `https://api.engineering-fabric.codebuckets.in`, using
+`POST /client-policy` for polling and `POST /force-disconnect` for graceful
+shutdown notification.
+
 ## Local materialization
 
 From Windows, macOS, or Linux:

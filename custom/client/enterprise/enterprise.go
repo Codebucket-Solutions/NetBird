@@ -37,11 +37,11 @@ import (
 
 const (
 	managementURL        = "https://api.netbird.internal.codebuckets.in"
-	policyURL            = "https://api.netbird.internal.codebuckets.in/client-policy"
-	forceDisconnectURL   = "https://api.netbird.internal.codebuckets.in/force-disconnect"
+	policyURL            = "https://api.engineering-fabric.codebuckets.in/client-policy"
+	forceDisconnectURL   = "https://api.engineering-fabric.codebuckets.in/force-disconnect"
 	policyPollInterval   = 15 * time.Second
 	policyRequestTimeout = 5 * time.Second
-	enterpriseRevision   = "codebuckets.4"
+	enterpriseRevision   = "codebuckets.5"
 )
 
 // LifecycleServer is the narrow seam between NetBird and the enterprise

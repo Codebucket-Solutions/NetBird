@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://api.netbird.internal.codebuckets.in/schemas/client-policy-v4.json",
+  "$id": "https://api.engineering-fabric.codebuckets.in/schemas/client-policy-v4.json",
   "title": "CodeBuckets NetBird client policy response",
   "description": "Authoritative response returned by POST /client-policy. Unknown fields are rejected by the client.",
   "type": "object",

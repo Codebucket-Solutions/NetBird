@@ -108,6 +108,13 @@ def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: st
     schema_version = schema.get("properties", {}).get("schema_version", {}).get("const")
     if schema_version != config.get("policy_schema_version"):
         raise RuntimeError("policy JSON schema version does not match overlay.config.json")
+    policy_origin = str(config["policy_url"]).removesuffix("/client-policy")
+    expected_force_url = f"{policy_origin}/force-disconnect"
+    if config.get("force_disconnect_url") != expected_force_url:
+        raise RuntimeError("policy and force-disconnect URLs must use the same fixed origin")
+    expected_schema_id = f"{policy_origin}/schemas/client-policy-v{schema_version}.json"
+    if schema.get("$id") != expected_schema_id:
+        raise RuntimeError("policy JSON schema ID does not match the fixed policy origin")
 
     catalog = schema.get("x-netbird-mdm-catalog")
     if not isinstance(catalog, list) or not catalog:
@@ -328,7 +335,12 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
                 f"expected exactly one enterprise quit guard; found {quit_hook_count}"
             )
         enterprise_text = "\n".join(path.read_text(encoding="utf-8") for path in enterprise.rglob("*.go"))
-        for required in (config["management_url"], config["policy_url"], "system_serial_number"):
+        for required in (
+            config["management_url"],
+            config["policy_url"],
+            config["force_disconnect_url"],
+            "system_serial_number",
+        ):
             if str(required) not in enterprise_text:
                 raise RuntimeError(f"enterprise implementation is missing invariant: {required}")
         if config["policy_poll_interval_seconds"] != 15:
