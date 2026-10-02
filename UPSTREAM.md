@@ -3,12 +3,12 @@
 ## Current lock
 
 - Repository: `netbirdio/netbird`
-- Stable release: `v0.78.0`
-- Annotated tag object: `e3d9198023f9a6106ddd2c28c773b9f6bc7f3f6b`
-- Peeled commit: `7c1253004b1c1f95d343c0db8a9971680e0687f4`
+- Stable release: `v0.80.0`
+- Annotated tag object: `dbd5923a0acfc3110f2174225c9fede2e7e3a2bb`
+- Peeled commit: `fca64287cf51a85552a41b022013abbfdb335452`
 - GitHub commit verification: verified (`valid`)
-- Published: 2026-09-03 19:25:58 UTC
-- Locked: 2026-09-06 (previous lock `v0.77.1` at `79a06720b684768b421f0a54f3bb14f22704994f`, locked 2026-08-22)
+- Published: 2026-10-01 16:08:09 UTC
+- Locked: 2026-10-02 (previous lock `v0.78.0` at `7c1253004b1c1f95d343c0db8a9971680e0687f4`, locked 2026-09-06)
 
 The tag and commit were resolved from the official GitHub release and the exact
 `https://github.com/netbirdio/netbird.git` remote. The annotated release tag is
@@ -27,6 +27,34 @@ For every proposed lock change, record:
 - patch application result and `git range-diff`;
 - Windows/macOS qualification results;
 - approved exceptions, owners, and rollback version.
+
+## Upgrade record: v0.78.0 to v0.80.0 (reviewed and locked 2026-10-02)
+
+Reviewed by reconstructing both versions with `scripts/overlay.py materialize`
+and comparing the upstream files the overlay depends on. There was no Go
+toolchain for this review; compilation and tests are the Windows qualification
+workflow's job.
+
+- **Patches:** both apply unchanged. `client/cmd/service_controller.go` and
+  `client/ui/tray.go` are identical in the two versions.
+- **Daemon RPC surface:** `client/proto/daemon.proto` is identical. The RPC
+  classification test needs no change.
+- **Native MDM keys:** the key set in `client/mdm/policy.go` is unchanged, so
+  the control registry and the policy schema still agree.
+- **MDM loading:** the daemon now owns an `mdm.Loader` and applies the policy
+  with `Config.ApplyMDMPolicy` after loading a config; `profilemanager` no
+  longer reads the MDM store itself. The overlay uses only the `mdm.Key*`
+  names and `profilemanager.UpdateOrCreateConfig`, neither of which changed.
+- **Unchanged and relied on:** `ParseServiceURL`, the `ServiceManager` methods
+  the wrapper calls, `ResolveProfile` (still rejects an empty handle),
+  `GetActiveProfile`, the daemon status values, the `Up` handling of
+  `NeedsLogin`, the IPv6 exit-route suffix, `system.GetInfo`, and
+  `version.version`.
+- **UI:** `client/ui/services/settings.go` now aliases its MDM types to the
+  `mdm` package. The overlay's `GetEnterpriseControls` uses only the daemon
+  connection and `GetConfig`.
+- **Toolchain:** still Go 1.26; the Wails fork revision moved, and the workflow
+  installs the CLI from the locked module graph.
 
 ## Upgrade record: v0.77.1 to v0.78.0 (reviewed and locked 2026-09-06)
 
@@ -105,7 +133,7 @@ block in `policy/peer-admission.schema.json` (both since removed, see below),
 and the version mentions in the plans and README. `qualify.yml` must pass on
 Windows runners before this lock is used for a release.
 
-## Policy contract change (2026-10-02, still on v0.78.0)
+## Policy contract change (2026-10-02)
 
 The client policy contract was replaced by a smaller one; nothing in the lock
 changed. This supersedes the contract details in the upgrade record above.
