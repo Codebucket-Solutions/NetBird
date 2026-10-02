@@ -35,8 +35,10 @@ and comparing the upstream files the overlay depends on. There was no Go
 toolchain for this review; compilation and tests are the Windows qualification
 workflow's job.
 
-- **Patches:** both apply unchanged. `client/cmd/service_controller.go` and
-  `client/ui/tray.go` are identical in the two versions.
+- **Patch:** the two hooks apply unchanged. `client/cmd/service_controller.go`
+  and `client/ui/tray.go` are identical in the two versions. The hooks were two
+  patch files until 2026-10-02 and are now the single
+  `0001-enterprise-enforce-managed-client-policy.patch`.
 - **Daemon RPC surface:** `client/proto/daemon.proto` is identical. The RPC
   classification test needs no change.
 - **Native MDM keys:** the key set in `client/mdm/policy.go` is unchanged, so

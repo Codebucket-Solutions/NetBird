@@ -1,5 +1,5 @@
 diff --git a/client/cmd/service_controller.go b/client/cmd/service_controller.go
-index b187a7b87dfbf42087f06f221d63ad1da6a64490..5bb740849a24034f9e1004ed567fbc664a10e846 100644
+index e9a0e055f177ab85b05d9578407df95c65f3b17a..f0a94db3618e33dc875fe7d890c948efd0f6d2a7 100644
 --- a/client/cmd/service_controller.go
 +++ b/client/cmd/service_controller.go
 @@ -14,6 +14,7 @@ import (
@@ -10,7 +10,7 @@ index b187a7b87dfbf42087f06f221d63ad1da6a64490..5bb740849a24034f9e1004ed567fbc66
  	"github.com/netbirdio/netbird/client/internal/daemonaddr"
  	"github.com/netbirdio/netbird/client/internal/ipcauth"
  	"github.com/netbirdio/netbird/client/proto"
-@@ -142,14 +143,15 @@ func (p *program) serve(daemonListener, jsonListener *socketListener) error {
+@@ -144,14 +145,15 @@ func (p *program) serve(daemonListener, jsonListener *socketListener) error {
  		return nil
  	}
  
@@ -28,3 +28,17 @@ index b187a7b87dfbf42087f06f221d63ad1da6a64490..5bb740849a24034f9e1004ed567fbc66
  	p.serverInstanceMu.Unlock()
  
  	if jsonListener == nil {
+diff --git a/client/ui/tray.go b/client/ui/tray.go
+index c392a0b62ee7371402c8b26fc60ce455eda900da..f76e86e16f6eb5f6f93d1c4faadb372626a05cd9 100644
+--- a/client/ui/tray.go
++++ b/client/ui/tray.go
+@@ -492,6 +492,9 @@ func (t *Tray) buildMenu() *application.Menu {
+ }
+ 
+ func (t *Tray) handleQuit() {
++	if t.enterpriseQuitDisabled() {
++		return
++	}
+ 	services.BeginShutdown()
+ 	t.profileMu.Lock()
+ 	if t.switchCancel != nil {

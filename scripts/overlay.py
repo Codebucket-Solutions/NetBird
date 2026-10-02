@@ -24,6 +24,7 @@ STABLE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 PATCH_HASH = re.compile(r"^([0-9a-fA-F]{64})  (.+)$")
 PATCH_DIFF = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
+ENTERPRISE_HOOK_PATCH = "0001-enterprise-enforce-managed-client-policy.patch"
 ENTERPRISE_HOOK_PATHS = {
     "client/cmd/service_controller.go",
     "client/ui/tray.go",
@@ -557,34 +558,27 @@ def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
 
     patch_output = output / "patches"
     patch_output.mkdir(parents=True)
-    patch_specs = (
-        ("0001-enterprise-enforce-managed-client-policy.patch", "client/cmd/service_controller.go"),
-        ("0002-enterprise-guard-ui-quit.patch", "client/ui/tray.go"),
-    )
-    manifest_lines: list[str] = []
-    for patch_name, hook_path in patch_specs:
-        hook_diff = run(
-            "git",
-            "diff",
-            "--binary",
-            "--full-index",
-            f"{base}..HEAD",
-            "--",
-            hook_path,
-            cwd=source,
-        ).stdout
-        if not hook_diff.strip():
+    # The overlay carries exactly one patch. It holds every upstream hook.
+    hook_paths = sorted(ENTERPRISE_HOOK_PATHS)
+    hook_diff = run(
+        "git",
+        "diff",
+        "--binary",
+        "--full-index",
+        f"{base}..HEAD",
+        "--",
+        *hook_paths,
+        cwd=source,
+    ).stdout
+    changed_hooks = {before for before, _ in PATCH_DIFF.findall(hook_diff)}
+    for hook_path in hook_paths:
+        if hook_path not in changed_hooks:
             raise RuntimeError(f"development source has no enterprise hook change: {hook_path}")
-        patch_path = patch_output / patch_name
-        patch_path.write_text(hook_diff, encoding="utf-8", newline="\n")
-        manifest_lines.append(f"{hashlib.sha256(patch_path.read_bytes()).hexdigest()}  {patch_name}")
-    (patch_output / "series").write_text(
-        "\n".join(name for name, _ in patch_specs) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    patch_path = patch_output / ENTERPRISE_HOOK_PATCH
+    patch_path.write_text(hook_diff, encoding="utf-8", newline="\n")
+    (patch_output / "series").write_text(ENTERPRISE_HOOK_PATCH + "\n", encoding="utf-8", newline="\n")
     (patch_output / "manifest.sha256").write_text(
-        "\n".join(manifest_lines) + "\n",
+        f"{hashlib.sha256(patch_path.read_bytes()).hexdigest()}  {ENTERPRISE_HOOK_PATCH}\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -594,7 +588,7 @@ def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
             "base_commit": base,
             "source_head": run("git", "rev-parse", "HEAD", cwd=source).stdout.strip(),
             "output_directory": str(output),
-            "patch_files": [name for name, _ in patch_specs],
+            "patch_files": [ENTERPRISE_HOOK_PATCH],
             "custom_file_count": len([path for path in custom_output.rglob("*") if path.is_file()]),
         }
     )

@@ -7,21 +7,23 @@ vendor the upstream source tree.
 Every build is reconstructed from four immutable inputs:
 
 1. `upstream.lock.json`, which pins the upstream annotated tag and commit;
-2. the ordered patches listed in `patches/series`; and
+2. the one patch listed in `patches/series`; and
 3. the enterprise Go sources under `custom/`; and
 4. the overlay Git commit containing the scripts and workflows.
 
 The upstream checkout under the parent workspace (`../netbird-original`) is a
 developer reference only. CI never trusts or packages it. CI creates a fresh
-checkout from the lock and applies the patch series.
+checkout from the lock and applies the patch.
 
 ## Current implementation status
 
-There are two deliberately tiny upstream touchpoints: the daemon composition
-hook in `client/cmd/service_controller.go`, and one guard call at the start of
-the desktop tray's Quit handler. All policy, enforcement, polling, and UI guard
+The overlay carries exactly one patch,
+`patches/0001-enterprise-enforce-managed-client-policy.patch`. It makes two
+deliberately tiny changes to upstream: the daemon composition hook in
+`client/cmd/service_controller.go`, and one guard call at the start of the
+desktop tray's Quit handler. All policy, enforcement, polling, and UI guard
 logic is maintained as ordinary Go source under `custom/client`, outside the
-patches. Production publication remains disabled in `overlay.config.json`.
+patch. Production publication remains disabled in `overlay.config.json`.
 
 The machine-readable API contract lives in `policy/client-policy.schema.json`.
 A policy response carries a `policyId`, a `validUntil` lease, one flat
@@ -84,7 +86,7 @@ python scripts/overlay.py materialize --destination build/source
 ```
 
 The command verifies upstream provenance and the patch manifest, applies the
-two tiny hook patches, copies the custom source tree, creates one deterministic overlay
+hook patch, copies the custom source tree, creates one deterministic overlay
 commit, and runs the invariants. It refuses to reuse an existing destination.
 
 ## Patch development
@@ -100,9 +102,9 @@ python scripts/overlay.py export \
 ```
 
 The export contains `custom/` and `patches/`. Review both before replacing the
-canonical overlay payload. Patches are restricted to the daemon composition
+canonical overlay payload. The patch is restricted to the daemon composition
 block and the one tray Quit guard; custom policy code must never be embedded in
-either patch.
+it.
 
 ## GitHub Actions
 
