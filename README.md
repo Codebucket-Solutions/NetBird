@@ -23,7 +23,7 @@ deliberately tiny changes to upstream: the daemon composition hook in
 `client/cmd/service_controller.go`, and one guard call at the start of the
 desktop tray's Quit handler. All policy, enforcement, polling, and UI guard
 logic is maintained as ordinary Go source under `custom/client`, outside the
-patch. Production publication remains disabled in `overlay.config.json`.
+patch.
 
 The machine-readable API contract lives in `policy/client-policy.schema.json`.
 A policy response carries a `policyId`, a `validUntil` lease, one flat
@@ -67,11 +67,14 @@ Two values are set when the daemon is linked, not in source:
 - **Fleet token.** The policy server accepts polls only with the fleet token.
   A production build sets it with
   `-X github.com/netbirdio/netbird/client/enterprise.policyToken=...`. It is
-  never committed, and the workflows in this repository do not set it: this
-  repository is public, and so are the artifacts of its workflow runs. A
-  candidate built here therefore polls without a token and is answered 401. A
-  build without a linked token reads `NB_ENTERPRISE_POLICY_TOKEN`, which is
-  meant for development.
+  never committed. Only the release workflow links it, and only when the
+  repository secret `NB_ENTERPRISE_POLICY_TOKEN` exists. Releases are served
+  from a public download host, so a token linked into them is readable by
+  anyone who downloads a build; it identifies the build, not a device.
+  Candidates built on a push or pull request never carry it and are answered
+  401 by the policy server. A build without a linked token reads the
+  `NB_ENTERPRISE_POLICY_TOKEN` environment variable, which is meant for
+  development.
 
 Because the stamped version is a release version, keep automatic client
 updates disabled in the NetBird management settings; an automatic update would
@@ -112,9 +115,35 @@ it.
   lock-update PR. It never releases.
 - `qualify.yml` reconstructs, verifies, tests, and builds Windows amd64/arm64
   candidates entirely on Windows runners. There is no Linux or macOS job.
-- `release.yml` supports a signing-only CI test that cannot publish a release.
-  Normal release dispatches Authenticode-sign Windows candidates and creates a
-  Windows-only draft release.
+- `release.yml` rebuilds the candidates, Authenticode-signs them, uploads them
+  to the release bucket, and then switches `latest.json` to the new version.
+  It starts from the Actions tab or by pushing the release tag, for example
+  `v0.80.0-enterprise.6`. It creates no GitHub release. A signing-only test
+  run publishes nothing.
+
+## Releases and forced updates
+
+Releases are served from `https://netbird-client.download.codebuckets.in`:
+
+- `latest.json` names the only version that is allowed to connect, with the
+  download URL and SHA-256 of each archive.
+- `releases/<tag>/` holds the signed archives of one release and is never
+  overwritten.
+
+Publishing a release makes every older build stop working:
+
+- The daemon reads `latest.json` when it starts and every five minutes. When a
+  newer version is published it disconnects and refuses to connect or log in;
+  the error tells the user which version to install and where to get it. When
+  the manifest cannot be read the daemon keeps what it last knew, so an
+  unreachable download host does not take the fleet offline.
+- Engineering Fabric refuses the policy poll of an outdated build with HTTP
+  426, which the daemon treats the same way, and does not admit an outdated
+  peer to the network. That refusal, not the client's own check, is what makes
+  the rule hold for a build that never asks.
+
+A release must be newer than the published one; `scripts/overlay.py
+release-manifest` refuses anything else.
 
 The server side of the contract, including admission and rollout, is described
 in `NETBIRD.md` and `docs/NETBIRD_OPERATIONS.md` in the Engineering Fabric

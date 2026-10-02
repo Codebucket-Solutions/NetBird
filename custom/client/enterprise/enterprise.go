@@ -30,6 +30,7 @@ import (
 	"github.com/netbirdio/netbird/client/mdm"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/client/system"
+	"github.com/netbirdio/netbird/version"
 )
 
 const (
@@ -193,6 +194,7 @@ type policyController struct {
 	endpoint   string
 	httpClient *http.Client
 	now        func() time.Time
+	updates    *updateGate
 
 	mu                sync.RWMutex
 	snapshot          policyResponse
@@ -208,17 +210,19 @@ func newPolicyController(raw LifecycleServer, certificate *tls.Certificate) *pol
 		transport.TLSClientConfig.Certificates = []tls.Certificate{*certificate}
 	}
 
-	return &policyController{
-		raw:      raw,
-		endpoint: policyURL,
-		httpClient: &http.Client{
-			Transport: transport,
-			Timeout:   policyRequestTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return errors.New("enterprise policy redirects are disabled")
-			},
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   policyRequestTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("enterprise policy redirects are disabled")
 		},
-		now: time.Now,
+	}
+	return &policyController{
+		raw:        raw,
+		endpoint:   policyURL,
+		httpClient: httpClient,
+		now:        time.Now,
+		updates:    newUpdateGate(version.NetbirdVersion(), httpClient, time.Now),
 	}
 }
 
@@ -237,8 +241,12 @@ func (p *policyController) run(ctx context.Context) {
 }
 
 func (p *policyController) pollAndReconcile(ctx context.Context) {
-	if err := p.poll(ctx); err != nil {
-		p.logFailure(err)
+	p.updates.refreshIfDue(ctx)
+	// An outdated build is refused by the policy server, so there is nothing to ask for.
+	if p.updates.requiredVersion() == "" {
+		if err := p.poll(ctx); err != nil {
+			p.logFailure(err)
+		}
 	}
 	p.reconcile(ctx)
 }
@@ -277,6 +285,9 @@ func (p *policyController) poll(ctx context.Context) error {
 		return fmt.Errorf("request policy: %w", err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUpgradeRequired {
+		p.updates.refuseOutdated()
+	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("policy server returned HTTP %d", response.StatusCode)
 	}
@@ -456,6 +467,10 @@ func (p *policyController) reconcile(parent context.Context) {
 
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
+	if p.updates.requiredVersion() != "" {
+		p.disconnectOutdatedBuild(ctx)
+		return
+	}
 	if controls.KeepConnected && p.isIdle(ctx) {
 		if _, err := p.raw.Up(ctx, &proto.UpRequest{Async: true}); err != nil {
 			log.Warnf("enterprise policy could not converge to keepConnected: %v", err)
@@ -464,6 +479,22 @@ func (p *policyController) reconcile(parent context.Context) {
 
 	p.reconcileDisableAutoConnect(ctx)
 	p.reconcileExitNode(ctx)
+}
+
+// disconnectOutdatedBuild takes a build that has been superseded off the
+// network. The wrapper refuses to connect it again until it is replaced.
+func (p *policyController) disconnectOutdatedBuild(ctx context.Context) {
+	response, err := p.raw.Status(ctx, &proto.StatusRequest{})
+	if err != nil {
+		return
+	}
+	daemonStatus := response.GetStatus()
+	if daemonStatus != string(internal.StatusConnected) && daemonStatus != string(internal.StatusConnecting) {
+		return
+	}
+	if _, err := p.raw.Down(ctx, &proto.DownRequest{}); err != nil {
+		log.Warnf("enterprise policy could not disconnect an outdated build: %v", err)
+	}
 }
 
 // isIdle reports whether the daemon is logged in but not connected, which is
@@ -688,7 +719,18 @@ func (s *wrappedServer) effectiveExitNode() exitNodePolicy {
 	return s.policy.exitNode(s.policy.now())
 }
 
+// updateDenial is non-nil while a newer build has been released.
+func (s *wrappedServer) updateDenial() error {
+	if s.policy == nil {
+		return nil
+	}
+	return s.policy.updates.denial()
+}
+
 func (s *wrappedServer) Login(ctx context.Context, request *proto.LoginRequest) (*proto.LoginResponse, error) {
+	if err := s.updateDenial(); err != nil {
+		return nil, err
+	}
 	if request == nil {
 		request = &proto.LoginRequest{}
 	}
@@ -700,6 +742,9 @@ func (s *wrappedServer) Login(ctx context.Context, request *proto.LoginRequest) 
 }
 
 func (s *wrappedServer) Up(ctx context.Context, request *proto.UpRequest) (*proto.UpResponse, error) {
+	if err := s.updateDenial(); err != nil {
+		return nil, err
+	}
 	if request == nil {
 		request = &proto.UpRequest{}
 	}

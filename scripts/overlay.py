@@ -21,6 +21,7 @@ from typing import Any
 
 
 STABLE_TAG = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+BUILD_VERSION = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)\+codebuckets\.([0-9]+)$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 PATCH_HASH = re.compile(r"^([0-9a-fA-F]{64})  (.+)$")
 PATCH_DIFF = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
@@ -318,6 +319,7 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
         for required in (
             config["management_url"],
             config["policy_url"],
+            config["release_base_url"],
         ):
             if str(required) not in enterprise_text:
                 raise RuntimeError(f"enterprise implementation is missing invariant: {required}")
@@ -615,12 +617,12 @@ def release_preflight(args: argparse.Namespace, overlay_root: Path) -> None:
     print_result({"release_tag": release_tag, "upstream_tag": upstream_tag})
 
 
-def build_version(args: argparse.Namespace, overlay_root: Path) -> None:
-    """Print the version an enterprise build reports, for example 0.78.0+codebuckets.6.
+def release_identity(overlay_root: Path) -> tuple[str, str]:
+    """Return the version an enterprise build reports and the tag it is released under.
 
-    The upstream version comes first so NetBird keeps treating the build as that
-    release. Engineering Fabric admits only peers whose version carries the
-    "+codebuckets." stamp.
+    The version is the upstream version followed by the enterprise revision, for
+    example 0.80.0+codebuckets.6, released as v0.80.0-enterprise.6. Engineering
+    Fabric admits only peers whose version carries the "+codebuckets." stamp.
     """
     config = read_json(overlay_root / "overlay.config.json")
     lock = read_json(overlay_root / "upstream.lock.json")
@@ -629,7 +631,59 @@ def build_version(args: argparse.Namespace, overlay_root: Path) -> None:
     if not STABLE_TAG.fullmatch(upstream_tag):
         raise RuntimeError("locked upstream tag is not stable")
     revision = int(config["enterprise_revision"])
-    print(f"{upstream_tag.removeprefix('v')}+codebuckets.{revision}")
+    return f"{upstream_tag.removeprefix('v')}+codebuckets.{revision}", f"{upstream_tag}-enterprise.{revision}"
+
+
+def build_version(args: argparse.Namespace, overlay_root: Path) -> None:
+    print(release_identity(overlay_root)[0])
+
+
+def version_order(version: str) -> tuple[int, int, int, int]:
+    match = BUILD_VERSION.fullmatch(version)
+    if not match:
+        raise RuntimeError(f"not an enterprise build version: {version}")
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def release_manifest(args: argparse.Namespace, overlay_root: Path) -> None:
+    """Write latest.json for the signed archives of the current release.
+
+    Clients read this file to learn which build is allowed to connect, so
+    publishing it is what makes every older build stop working. A release that
+    is not newer than the published one is refused.
+    """
+    config = read_json(overlay_root / "overlay.config.json")
+    version, release_tag = release_identity(overlay_root)
+    base_url = str(config["release_base_url"]).rstrip("/")
+
+    if args.published_manifest and Path(args.published_manifest).is_file():
+        published = str(read_json(Path(args.published_manifest)).get("version", ""))
+        if version_order(version) <= version_order(published):
+            raise RuntimeError(f"release {version} is not newer than the published {published}")
+
+    artifacts = []
+    for archive in sorted(Path(args.artifacts_directory).resolve().glob("netbird-enterprise-*.zip")):
+        artifacts.append(
+            {
+                "platform": archive.stem.removeprefix("netbird-enterprise-"),
+                "url": f"{base_url}/releases/{release_tag}/{archive.name}",
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "size": archive.stat().st_size,
+            }
+        )
+    if not artifacts:
+        raise RuntimeError("no signed archives found for the release manifest")
+
+    manifest = {
+        "version": version,
+        "releaseTag": release_tag,
+        "publishedAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "artifacts": artifacts,
+    }
+    atomic_json_write(Path(args.output).resolve(), manifest)
+    github_output("version", version)
+    github_output("release_tag", release_tag)
+    print_result(manifest)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -662,6 +716,12 @@ def parser() -> argparse.ArgumentParser:
 
     version_parser = commands.add_parser("build-version", help="print the version an enterprise build reports")
     version_parser.set_defaults(handler=build_version)
+
+    manifest_parser = commands.add_parser("release-manifest", help="write latest.json for the signed archives")
+    manifest_parser.add_argument("--artifacts-directory", required=True)
+    manifest_parser.add_argument("--output", required=True)
+    manifest_parser.add_argument("--published-manifest", help="the latest.json currently published, if any")
+    manifest_parser.set_defaults(handler=release_manifest)
 
     release_parser = commands.add_parser("release-preflight", help="enforce protected release gates")
     release_parser.add_argument("--enterprise-revision", required=True)

@@ -19,6 +19,15 @@ on:
         required: false
         default: true
         type: boolean
+      embed_fleet_token:
+        description: Link the fleet token into the daemon; only the release workflow asks for this
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      NB_ENTERPRISE_POLICY_TOKEN:
+        description: Fleet token linked into release builds when embed_fleet_token is set
+        required: false
 
 permissions:
   contents: read
@@ -99,6 +108,9 @@ jobs:
         shell: bash
         env:
           TARGET_ARCH: ${{ matrix.arch }}
+          # Empty for every run except a release that passes the secret. The
+          # build and its artifacts are public, so is a token linked into them.
+          FLEET_TOKEN: ${{ inputs.embed_fleet_token && secrets.NB_ENTERPRISE_POLICY_TOKEN || '' }}
         run: |
           set -euo pipefail
           output="$PWD/enterprise-dist/windows-${TARGET_ARCH}"
@@ -110,9 +122,14 @@ jobs:
           netbird_version="$(python "$overlay_root/scripts/overlay.py" build-version)"
           echo "Enterprise build version: ${netbird_version}"
 
+          ldflags="-X github.com/netbirdio/netbird/version.version=${netbird_version}"
+          if [ -n "$FLEET_TOKEN" ]; then
+            ldflags="${ldflags} -X github.com/netbirdio/netbird/client/enterprise.policyToken=${FLEET_TOKEN}"
+          fi
+
           CGO_ENABLED=0 GOOS=windows GOARCH="$TARGET_ARCH" \
             go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' \
-              -ldflags "-X github.com/netbirdio/netbird/version.version=${netbird_version}" \
+              -ldflags "$ldflags" \
               -o "$output/netbird.exe" ./client
 
           (

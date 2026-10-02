@@ -1,6 +1,12 @@
-name: Create enterprise draft release
+name: Publish enterprise release
 
+# A release starts from the Actions tab, or by pushing its tag
+# (for example v0.80.0-enterprise.6). The tag must match the lock and the
+# enterprise revision in overlay.config.json.
 on:
+  push:
+    tags:
+      - 'v*-enterprise.*'
   workflow_dispatch:
     inputs:
       enterprise_revision:
@@ -44,10 +50,22 @@ jobs:
         shell: bash
         env:
           REQUESTED_REVISION: ${{ inputs.enterprise_revision }}
-        run: >-
-          python scripts/overlay.py release-preflight
-          --enterprise-revision "$REQUESTED_REVISION"
-          ${{ inputs.signing_test_only && '--allow-release-disabled' || '' }}
+          PUSHED_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          set -euo pipefail
+          # A pushed tag ends in the enterprise revision.
+          revision="${REQUESTED_REVISION:-${PUSHED_TAG##*.}}"
+          gate="$(python scripts/overlay.py release-preflight \
+            --enterprise-revision "$revision" \
+            ${{ inputs.signing_test_only && '--allow-release-disabled' || '' }})"
+          echo "$gate"
+          if [ -n "$PUSHED_TAG" ]; then
+            expected="$(printf '%s' "$gate" | python -c 'import json,sys; print(json.load(sys.stdin)["release_tag"])')"
+            if [ "$PUSHED_TAG" != "$expected" ]; then
+              echo "Pushed tag $PUSHED_TAG does not match the configured release $expected" >&2
+              exit 1
+            fi
+          fi
 
   qualify:
     name: Rebuild protected candidates
@@ -55,6 +73,9 @@ jobs:
     uses: ./.github/workflows/qualify.yml
     with:
       require_enterprise_hook: true
+      embed_fleet_token: true
+    secrets:
+      NB_ENTERPRISE_POLICY_TOKEN: ${{ secrets.NB_ENTERPRISE_POLICY_TOKEN }}
     permissions:
       contents: read
 
@@ -108,17 +129,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  draft-release:
-    name: Publish signed-Windows draft
-    if: ${{ inputs.signing_test_only == false }}
+  publish-bucket:
+    name: Publish to the release bucket
+    if: ${{ !inputs.signing_test_only }}
     needs:
       - preflight
-      - qualify
       - sign-windows
     runs-on: windows-2022
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_ENDPOINT_URL: https://242336bb32cd0b7be83c597188934f79.r2.cloudflarestorage.com
+      # R2 does not implement the newer default checksum trailers.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      RELEASE_BUCKET: codebucket-netbird-client
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
     steps:
       - name: Check out enterprise overlay
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -137,57 +165,51 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Reconstruct and archive auditable source
+      - name: Build the release manifest
         shell: bash
         run: |
           set -euo pipefail
-          temp_dir="$(cygpath -u '${{ runner.temp }}')"
-          python scripts/overlay.py materialize \
-            --destination "$temp_dir/netbird-source" \
-            --require-enterprise-hook
-          git -C "$temp_dir/netbird-source" archive \
-            --format=tar.gz \
-            --prefix='netbird-enterprise-source/' \
-            --output="$PWD/release-assets/netbird-enterprise-source.tar.gz" \
-            HEAD
-          cp "$temp_dir/netbird-source.provenance.json" './release-assets/source-provenance.json'
+          # The published manifest, when there is one, proves this release is newer.
+          published_arguments=()
+          if aws s3 cp "s3://${RELEASE_BUCKET}/latest.json" published-latest.json --no-progress >/dev/null 2>&1; then
+            published_arguments=(--published-manifest published-latest.json)
+          fi
+          python scripts/overlay.py release-manifest \
+            --artifacts-directory release-assets \
+            --output latest.json \
+            "${published_arguments[@]}"
 
-      - name: Create aggregate checksums
+      - name: Refuse to overwrite a published release
         shell: bash
-        working-directory: release-assets
         run: |
           set -euo pipefail
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
-            | sort -z \
-            | xargs -0 sha256sum \
-            | sed 's#  \./#  #' > SHA256SUMS
-          sha256sum --check SHA256SUMS
-
-      - name: Create immutable draft release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-          UPSTREAM_TAG: ${{ needs.preflight.outputs.upstream_tag }}
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-enterprise\.[1-9][0-9]*$ ]]
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release tag already exists and will not be overwritten: $RELEASE_TAG" >&2
+          if aws s3api head-object --bucket "$RELEASE_BUCKET" --key "releases/${RELEASE_TAG}/latest.json" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} is already in the bucket and will not be overwritten" >&2
             exit 1
           fi
 
-          notes_file="$(mktemp)"
-          trap 'rm -f "$notes_file"' EXIT
-          {
-            echo "Enterprise client candidate based on upstream ${UPSTREAM_TAG}."
-            echo
-            echo 'Windows executables are Authenticode-signed with the Codebucket private code-signing CA.'
-            echo 'This is a Windows-only draft release; no macOS artifact is included.'
-          } > "$notes_file"
+      # latest.json is what clients and Engineering Fabric read. It is switched
+      # last, so the release it names is already downloadable. From that moment
+      # every older build stops being allowed to connect.
+      - name: Upload the release, then switch latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp release-assets "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" \
+            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
+          aws s3 cp latest.json "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/latest.json" \
+            --content-type application/json --no-progress
+          aws s3 cp latest.json "s3://${RELEASE_BUCKET}/latest.json" \
+            --content-type application/json --cache-control 'no-cache, max-age=60' --no-progress
 
-          gh release create "$RELEASE_TAG" \
-            release-assets/* \
-            --draft \
-            --title "$RELEASE_TAG" \
-            --notes-file "$notes_file"
+      - name: Check what clients will download
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python -c 'import json; print(json.load(open("latest.json"))["version"])')"
+          published="$(curl -fsS --retry 5 --retry-delay 5 'https://netbird-client.download.codebuckets.in/latest.json' | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          if [ "$published" != "$expected" ]; then
+            echo "The public manifest names ${published}, expected ${expected}" >&2
+            exit 1
+          fi
+          echo "Published ${published}"
