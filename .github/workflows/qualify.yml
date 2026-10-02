@@ -140,8 +140,13 @@ jobs:
           temp_dir="$(cygpath -u '${{ runner.temp }}')"
           cp "$temp_dir/netbird-source.provenance.json" "$output/provenance.json"
 
+          # The files sit at the root of the archive. Signing looks for the
+          # executables there, and so does anyone who unpacks a release.
           archive="$PWD/enterprise-dist/netbird-enterprise-windows-${TARGET_ARCH}.zip"
-          python -m zipfile -c "$archive" "$output"
+          (
+            cd "$output"
+            python -m zipfile -c "$archive" netbird.exe netbird-ui.exe provenance.json
+          )
           python -c 'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); pathlib.Path(str(p)+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n", encoding="ascii")' "$archive"
 
       - name: Upload Windows candidate

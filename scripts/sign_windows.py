@@ -426,4 +426,11 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    sign(parse_args())
+    try:
+        sign(parse_args())
+    except Exception as error:
+        # Show the reason on the run's summary page. Only the first line: the
+        # rest of a tool failure is that tool's output and stays in the log.
+        reason = (str(error).splitlines() or [type(error).__name__])[0]
+        print(f"::error title=Windows signing failed::{reason}", flush=True)
+        raise
