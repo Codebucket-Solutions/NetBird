@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,9 @@ CUSTOM_SOURCE_PATTERNS = (
     "client/ui/enterprise_*.go",
     "client/ui/services/enterprise_*.go",
 )
+# Policy controls implemented by the enterprise wrapper itself. Every other
+# control key must be a native MDM key of the locked upstream release.
+ENTERPRISE_CONTROL_KEYS = {"keepConnected", "disableQuit"}
 
 
 def run(
@@ -105,41 +109,15 @@ def require_schema(lock: dict[str, Any], config: dict[str, Any]) -> None:
 def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: str) -> None:
     config = read_json(overlay_root / "overlay.config.json")
     schema = read_json(overlay_root / "policy" / "client-policy.schema.json")
-    schema_version = schema.get("properties", {}).get("schema_version", {}).get("const")
-    if schema_version != config.get("policy_schema_version"):
-        raise RuntimeError("policy JSON schema version does not match overlay.config.json")
-    policy_origin = str(config["policy_url"]).removesuffix("/client-policy")
-    expected_force_url = f"{policy_origin}/force-disconnect"
-    if config.get("force_disconnect_url") != expected_force_url:
-        raise RuntimeError("policy and force-disconnect URLs must use the same fixed origin")
-    expected_schema_id = f"{policy_origin}/schemas/client-policy-v{schema_version}.json"
+    policy_url = urllib.parse.urlsplit(str(config["policy_url"]))
+    expected_schema_id = f"{policy_url.scheme}://{policy_url.netloc}/schemas/netbird-client-policy.json"
     if schema.get("$id") != expected_schema_id:
         raise RuntimeError("policy JSON schema ID does not match the fixed policy origin")
 
-    catalog = schema.get("x-netbird-mdm-catalog")
-    if not isinstance(catalog, list) or not catalog:
-        raise RuntimeError("policy JSON schema has no MDM capability catalog")
-    catalog_keys = [str(item.get("key", "")) for item in catalog if isinstance(item, dict)]
-    if not all(catalog_keys) or len(catalog_keys) != len(set(catalog_keys)):
-        raise RuntimeError("policy MDM capability catalog contains empty or duplicate keys")
-
-    native_catalog_keys = {
-        str(item["key"])
-        for item in catalog
-        if isinstance(item, dict) and item.get("support") != "enterprise"
-    }
     mdm_source = (source / "client" / "mdm" / "policy.go").read_text(encoding="utf-8")
     native_source_constants = dict(
         re.findall(r'(Key[A-Za-z0-9]+)\s*=\s*"([^"]+)"', mdm_source)
     )
-    native_source_keys = set(native_source_constants.values())
-    if native_catalog_keys != native_source_keys:
-        missing = sorted(native_source_keys - native_catalog_keys)
-        stale = sorted(native_catalog_keys - native_source_keys)
-        raise RuntimeError(
-            "policy MDM catalog drifted from locked upstream "
-            f"(missing={missing}, stale={stale})"
-        )
 
     registry_match = re.search(
         r"var supportedNetBirdControls = map\[string\]struct\{\}\{(.*?)\n\}",
@@ -152,28 +130,29 @@ def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: st
     unknown_constants = sorted(registry_constants - set(native_source_constants))
     if unknown_constants:
         raise RuntimeError(f"enterprise native-control registry has unknown constants: {unknown_constants}")
-    registry_keys = {native_source_constants[name] for name in registry_constants}
-    schema_control_keys = set(
-        schema.get("properties", {})
-        .get("netBirdControls", {})
-        .get("propertyNames", {})
-        .get("enum", [])
-    )
-    if registry_keys != schema_control_keys:
+    go_control_keys = {native_source_constants[name] for name in registry_constants} | ENTERPRISE_CONTROL_KEYS
+    schema_control_keys = set(schema.get("properties", {}).get("controls", {}).get("properties", {}))
+    if go_control_keys != schema_control_keys:
         raise RuntimeError(
-            "policy schema and enterprise native-control registry differ "
-            f"(Go={sorted(registry_keys)}, JSON={sorted(schema_control_keys)})"
+            "policy schema and enterprise control registry differ "
+            f"(Go={sorted(go_control_keys)}, JSON={sorted(schema_control_keys)})"
         )
 
-    required_literals = (
-        f"SchemaVersion:         {schema_version}",
-        f'enterpriseRevision   = "codebuckets.{config["enterprise_revision"]}"',
-        'json:"netBirdControls"',
-        'json:"exit_node"',
-        'exitNodePinned         exitNodeMode = "PINNED"',
+    # Regular expressions rather than literals: gofmt re-aligns these
+    # declarations whenever a neighbouring name changes length.
+    revision = re.escape(str(config["enterprise_revision"]))
+    required_patterns = (
+        rf'enterpriseRevision\s*=\s*"codebuckets\.{revision}"',
+        r'controlKeepConnected\s*=\s*"keepConnected"',
+        r'controlDisableQuit\s*=\s*"disableQuit"',
+        r'json:"netbirdIp"',
+        r'json:"serialNumber"',
+        r'json:"controls"',
+        r'json:"exitNode"',
+        r'exitNodePinned\s+exitNodeMode\s*=\s*"PINNED"',
     )
-    for required in required_literals:
-        if required not in enterprise_text:
+    for required in required_patterns:
+        if not re.search(required, enterprise_text):
             raise RuntimeError(f"enterprise implementation is missing policy contract invariant: {required}")
 
 
@@ -338,8 +317,6 @@ def verify_source(source: Path, overlay_root: Path, require_hook: bool) -> dict[
         for required in (
             config["management_url"],
             config["policy_url"],
-            config["force_disconnect_url"],
-            "system_serial_number",
         ):
             if str(required) not in enterprise_text:
                 raise RuntimeError(f"enterprise implementation is missing invariant: {required}")
@@ -644,6 +621,23 @@ def release_preflight(args: argparse.Namespace, overlay_root: Path) -> None:
     print_result({"release_tag": release_tag, "upstream_tag": upstream_tag})
 
 
+def build_version(args: argparse.Namespace, overlay_root: Path) -> None:
+    """Print the version an enterprise build reports, for example 0.78.0+codebuckets.6.
+
+    The upstream version comes first so NetBird keeps treating the build as that
+    release. Engineering Fabric admits only peers whose version carries the
+    "+codebuckets." stamp.
+    """
+    config = read_json(overlay_root / "overlay.config.json")
+    lock = read_json(overlay_root / "upstream.lock.json")
+    require_schema(lock, config)
+    upstream_tag = str(lock["release_tag"])
+    if not STABLE_TAG.fullmatch(upstream_tag):
+        raise RuntimeError("locked upstream tag is not stable")
+    revision = int(config["enterprise_revision"])
+    print(f"{upstream_tag.removeprefix('v')}+codebuckets.{revision}")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--overlay-root", help="overlay repository root; defaults to the script parent")
@@ -671,6 +665,9 @@ def parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--source", required=True)
     export_parser.add_argument("--output", required=True)
     export_parser.set_defaults(handler=export_overlay)
+
+    version_parser = commands.add_parser("build-version", help="print the version an enterprise build reports")
+    version_parser.set_defaults(handler=build_version)
 
     release_parser = commands.add_parser("release-preflight", help="enforce protected release gates")
     release_parser.add_argument("--enterprise-revision", required=True)

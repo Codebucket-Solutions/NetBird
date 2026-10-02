@@ -1,116 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://api.engineering-fabric.codebuckets.in/schemas/client-policy-v4.json",
+  "$id": "https://api.engineering-fabric.codebuckets.in/schemas/netbird-client-policy.json",
   "title": "CodeBuckets NetBird client policy response",
-  "description": "Authoritative response returned by POST /client-policy. Unknown fields are rejected by the client.",
+  "description": "HTTP 200 body of POST /api/v1/netbird/client/policy. The request body is $defs.policyRequest. Any other status carries {\"error\":\"CODE\"}; the client reads only the status code. Forward compatibility: clients ignore unknown top-level fields and unknown control keys, and apply their strict default to a known control that is absent, so the server can add fields and controls without breaking deployed clients.",
   "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "revision",
-    "policy_id",
-    "enterpriseControls",
-    "issued_at",
-    "valid_until",
-    "reason_code",
-    "netBirdControls",
-    "exit_node"
-  ],
+  "additionalProperties": true,
+  "required": ["policyId", "validUntil", "controls", "exitNode"],
   "properties": {
-    "schema_version": {
-      "const": 4
-    },
-    "revision": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "policy_id": {
+    "policyId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "validUntil": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 256
+      "format": "date-time",
+      "description": "End of the lease. The client rejects a value that is not in the future or is more than 15 minutes ahead, and returns to strict defaults once it passes without a newer accepted response. There is no revision; replay is bounded by this lease."
     },
-    "enterpriseControls": {
+    "controls": {
       "type": "object",
-      "description": "Enterprise-only controls enforced by the daemon and desktop UI.",
-      "additionalProperties": false,
-      "required": [
-        "keepConnected",
-        "disableQuit"
-      ],
+      "description": "Flat set of boolean controls. keepConnected and disableQuit are enterprise controls; the other keys are NetBird's native MDM key names. Each default is the strict value the client applies when the key is absent. keepConnected=true together with disableAutoConnect=true is rejected.",
+      "additionalProperties": { "type": "boolean" },
       "properties": {
-        "keepConnected": {
-          "type": "boolean"
-        },
-        "disableQuit": {
-          "type": "boolean"
-        }
+        "keepConnected": { "type": "boolean", "default": true },
+        "disableQuit": { "type": "boolean", "default": true },
+        "disableUpdateSettings": { "type": "boolean", "default": true },
+        "disableProfiles": { "type": "boolean", "default": true },
+        "disableNetworks": { "type": "boolean", "default": true },
+        "disableAdvancedView": { "type": "boolean", "default": true },
+        "disableAutoConnect": { "type": "boolean", "default": false }
       }
     },
-    "issued_at": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "valid_until": {
-      "type": "string",
-      "format": "date-time"
-    },
-    "reason_code": {
-      "type": "string",
-      "maxLength": 256
-    },
-    "netBirdControls": {
-      "type": "object",
-      "description": "Sparse map using NetBird's exact native MDM key names. Omitted keys retain strict client defaults.",
-      "propertyNames": {
-        "enum": [
-          "disableUpdateSettings",
-          "disableProfiles",
-          "disableNetworks",
-          "disableAdvancedView",
-          "disableAutoConnect"
-        ]
-      },
-      "additionalProperties": {
-        "type": "boolean"
-      }
-    },
-    "exit_node": {
+    "exitNode": {
+      "description": "PINNED names the exact Network.ID returned by NetBird ListNetworks, without surrounding whitespace. DISABLED deselects default routes only.",
       "oneOf": [
         {
           "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "mode",
-            "network_id"
-          ],
+          "required": ["mode", "networkId"],
           "properties": {
-            "mode": {
-              "const": "PINNED"
-            },
-            "network_id": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
-            }
+            "mode": { "const": "PINNED" },
+            "networkId": { "type": "string", "minLength": 1, "maxLength": 256 }
           }
         },
         {
           "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "mode",
-            "network_id"
-          ],
+          "required": ["mode", "networkId"],
           "properties": {
-            "mode": {
-              "enum": [
-                "DISABLED",
-                "USER_CONTROLLED"
-              ]
-            },
-            "network_id": {
-              "const": ""
-            }
+            "mode": { "enum": ["DISABLED", "USER_CONTROLLED"] },
+            "networkId": { "const": "" }
           }
         }
       ]
@@ -120,359 +53,36 @@
     "policyRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "schema_version",
-        "peer_public_key",
-        "system_serial_number",
-        "hostname",
-        "os",
-        "os_version",
-        "upstream_version",
-        "enterprise_revision",
-        "current_policy_revision",
-        "exit_node_state"
-      ],
+      "required": ["netbirdIp", "serialNumber"],
       "properties": {
-        "schema_version": {
-          "const": 4
-        },
-        "peer_public_key": {
-          "type": "string"
-        },
-        "system_serial_number": {
+        "netbirdIp": {
           "type": "string",
-          "maxLength": 256
+          "minLength": 1,
+          "description": "The local peer's NetBird IP without a prefix length. The client sends no request while it has none."
         },
-        "hostname": {
-          "type": "string"
-        },
-        "os": {
-          "enum": [
-            "windows",
-            "darwin"
-          ]
-        },
-        "os_version": {
-          "type": "string"
-        },
-        "upstream_version": {
-          "type": "string"
-        },
-        "enterprise_revision": {
-          "type": "string"
-        },
-        "current_policy_revision": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "exit_node_state": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "available_network_ids",
-            "selected_network_ids"
-          ],
-          "properties": {
-            "available_network_ids": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "uniqueItems": true
-            },
-            "selected_network_ids": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "uniqueItems": true
-            }
-          }
-        }
-      }
-    },
-    "forceDisconnectRequest": {
-      "type": "object",
-      "description": "Best-effort POST body sent to /force-disconnect during graceful daemon/service shutdown.",
-      "additionalProperties": false,
-      "required": [
-        "schema_version",
-        "peer_public_key",
-        "system_serial_number",
-        "hostname",
-        "os",
-        "os_version",
-        "upstream_version",
-        "enterprise_revision",
-        "reason_code",
-        "occurred_at"
-      ],
-      "properties": {
-        "schema_version": {
-          "const": 1
-        },
-        "peer_public_key": {
-          "type": "string"
-        },
-        "system_serial_number": {
+        "serialNumber": {
           "type": "string",
-          "maxLength": 256
-        },
-        "hostname": {
-          "type": "string"
-        },
-        "os": {
-          "enum": [
-            "windows",
-            "darwin"
-          ]
-        },
-        "os_version": {
-          "type": "string"
-        },
-        "upstream_version": {
-          "type": "string"
-        },
-        "enterprise_revision": {
-          "type": "string"
-        },
-        "reason_code": {
-          "const": "CLIENT_SHUTDOWN"
-        },
-        "occurred_at": {
-          "type": "string",
-          "format": "date-time"
+          "maxLength": 256,
+          "description": "Trimmed system serial number. It must equal the serial the NetBird management server recorded for the peer."
         }
       }
     }
   },
-  "x-request-schema": {
-    "$ref": "#/$defs/policyRequest"
-  },
-  "x-force-disconnect-request-schema": {
-    "$ref": "#/$defs/forceDisconnectRequest"
-  },
+  "x-request-schema": { "$ref": "#/$defs/policyRequest" },
   "examples": [
     {
-      "schema_version": 4,
-      "revision": 43,
-      "policy_id": "account-default",
-      "enterpriseControls": {
+      "policyId": "engineering-always-on:v7",
+      "validUntil": "2026-10-02T10:05:00Z",
+      "controls": {
         "keepConnected": true,
-        "disableQuit": true
-      },
-      "issued_at": "2026-08-27T10:00:00Z",
-      "valid_until": "2026-08-27T10:05:00Z",
-      "reason_code": "ENTERPRISE_ALWAYS_ON",
-      "netBirdControls": {
+        "disableQuit": true,
         "disableUpdateSettings": true,
         "disableProfiles": true,
         "disableNetworks": true,
         "disableAdvancedView": true,
         "disableAutoConnect": false
       },
-      "exit_node": {
-        "mode": "PINNED",
-        "network_id": "Exit Node (blr-gateway-01)"
-      }
-    }
-  ],
-  "x-netbird-upstream": {
-    "release_tag": "v0.77.1",
-    "commit_sha": "79a06720b684768b421f0a54f3bb14f22704994f",
-    "platforms": [
-      "windows",
-      "darwin"
-    ]
-  },
-  "x-support-levels": {
-    "enforced": "The upstream client actively applies or gates this key.",
-    "ui_only": "The key changes desktop UI behavior but is not a daemon configuration value.",
-    "recognized_only": "The platform loader accepts the key, but v0.77.1 has no runtime consumer.",
-    "enterprise": "Implemented by the CodeBuckets enterprise wrapper rather than native MDM."
-  },
-  "x-netbird-mdm-catalog": [
-    {
-      "key": "managementURL",
-      "value_type": "string:url",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": "compiled_management_url",
-      "notes": "The enterprise build hardcodes this value and never accepts it from policy JSON."
-    },
-    {
-      "key": "disableUpdateSettings",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "enforced",
-      "api_mapping": "netBirdControls.disableUpdateSettings"
-    },
-    {
-      "key": "disableProfiles",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "enforced",
-      "api_mapping": "netBirdControls.disableProfiles"
-    },
-    {
-      "key": "disableNetworks",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "enforced",
-      "api_mapping": "netBirdControls.disableNetworks",
-      "notes": "Covers routed-network and exit-node selection UI/RPCs. Enterprise exit_node policy is evaluated separately."
-    },
-    {
-      "key": "disableAdvancedView",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "ui_only",
-      "api_mapping": "netBirdControls.disableAdvancedView"
-    },
-    {
-      "key": "disableClientRoutes",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null,
-      "notes": "Disables all received client routes and therefore conflicts with a pinned exit node when true. Keep in MDM until runtime config reload semantics are designed."
-    },
-    {
-      "key": "disableServerRoutes",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "blockInbound",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "disableMetricsCollection",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "recognized_only",
-      "api_mapping": null,
-      "notes": "Do not expose through the API until upstream has a runtime consumer."
-    },
-    {
-      "key": "allowServerSSH",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "disableAutoConnect",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": "netBirdControls.disableAutoConnect",
-      "notes": "Applied to daemon configuration every poll. A response combining true with enterpriseControls.keepConnected=true is rejected as contradictory."
-    },
-    {
-      "key": "disableAutostart",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "ui_only",
-      "api_mapping": null,
-      "notes": "Native MDM controls the GUI launch-on-login default; the daemon wrapper cannot safely replace this OS-level policy."
-    },
-    {
-      "key": "preSharedKey",
-      "value_type": "string:secret",
-      "category": "credential",
-      "support": "enforced",
-      "api_mapping": null,
-      "notes": "Never return credentials from the policy API. Use MDM or protected provisioning."
-    },
-    {
-      "key": "rosenpassEnabled",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "rosenpassPermissive",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "wireguardPort",
-      "value_type": "integer:1-65535",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "splitTunnelMode",
-      "value_type": "enum:allow|disallow",
-      "category": "configuration",
-      "support": "recognized_only",
-      "api_mapping": null,
-      "notes": "The v0.77.1 desktop loader recognizes this key, but the desktop daemon has no runtime consumer."
-    },
-    {
-      "key": "splitTunnelApps",
-      "value_type": "array:string",
-      "category": "configuration",
-      "support": "recognized_only",
-      "api_mapping": null,
-      "notes": "Paired with splitTunnelMode; do not expose until runtime support exists."
-    },
-    {
-      "key": "lazyConnection",
-      "value_type": "boolean",
-      "category": "configuration",
-      "support": "enforced",
-      "api_mapping": null
-    },
-    {
-      "key": "keepConnected",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "enterprise",
-      "api_mapping": "enterpriseControls.keepConnected",
-      "notes": "When true, Down is denied and the 15-second reconciler calls Up whenever daemon status is neither Connected nor Connecting."
-    },
-    {
-      "key": "disableQuit",
-      "value_type": "boolean",
-      "category": "restriction",
-      "support": "enterprise",
-      "api_mapping": "enterpriseControls.disableQuit",
-      "notes": "When true, the desktop tray Quit action is denied with a visible error. Policy lookup failure is fail-closed."
-    },
-    {
-      "key": "logout",
-      "value_type": "enum:ENABLED|DISABLED",
-      "category": "restriction",
-      "support": "enterprise",
-      "api_mapping": "compiled_disabled",
-      "notes": "Not a native MDM key; always disabled at the daemon RPC boundary."
-    },
-    {
-      "key": "clientUpdates",
-      "value_type": "enum:ENABLED|DISABLED",
-      "category": "restriction",
-      "support": "enterprise",
-      "api_mapping": "compiled_disabled",
-      "notes": "The fork's update RPC is always disabled independently from disableUpdateSettings."
-    },
-    {
-      "key": "exitNode",
-      "value_type": "object",
-      "category": "routing",
-      "support": "enterprise",
-      "api_mapping": "exit_node",
-      "notes": "PINNED uses the exact Network.ID returned by NetBird ListNetworks; DISABLED deselects default routes only."
+      "exitNode": { "mode": "DISABLED", "networkId": "" }
     }
   ]
 }

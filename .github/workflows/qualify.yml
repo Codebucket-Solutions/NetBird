@@ -104,8 +104,16 @@ jobs:
           output="$PWD/enterprise-dist/windows-${TARGET_ARCH}"
           mkdir -p "$output"
 
+          # The daemon reports this version to NetBird. Engineering Fabric
+          # admits only peers whose version carries the +codebuckets stamp.
+          overlay_root="$(cygpath -u '${{ github.workspace }}')"
+          netbird_version="$(python "$overlay_root/scripts/overlay.py" build-version)"
+          echo "Enterprise build version: ${netbird_version}"
+
           CGO_ENABLED=0 GOOS=windows GOARCH="$TARGET_ARCH" \
-            go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' -o "$output/netbird.exe" ./client
+            go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' \
+              -ldflags "-X github.com/netbirdio/netbird/version.version=${netbird_version}" \
+              -o "$output/netbird.exe" ./client
 
           (
             cd client/ui
