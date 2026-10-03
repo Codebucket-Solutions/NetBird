@@ -36,7 +36,22 @@ jobs:
           persist-credentials: false
 
       - name: Build Windows candidate
+        id: build
         uses: ./.github/actions/build-windows
         with:
           arch: ${{ matrix.arch }}
           run_tests: ${{ matrix.arch == 'amd64' }}
+
+      # The runner is amd64, so only that build can be started. The daemon runs
+      # as a service and the UI is kept running for a while; the enterprise
+      # hook polls the policy server and is expected to be refused here.
+      - name: Smoke test the build
+        if: matrix.arch == 'amd64'
+        shell: bash
+        env:
+          DISTRIBUTION: ${{ steps.build.outputs.distribution }}
+        run: |
+          set -euo pipefail
+          python scripts/smoke_windows.py \
+            --expected-version "$(python scripts/overlay.py build-version)" \
+            --directory "$(cygpath -u "$DISTRIBUTION")/windows-amd64"

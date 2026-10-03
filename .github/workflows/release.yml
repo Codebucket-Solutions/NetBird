@@ -199,6 +199,17 @@ jobs:
             exit 1
           fi
 
+      # A release is installed on the runner before it is uploaded: the daemon
+      # must run as a service and the UI must stay up, or nothing is published.
+      - name: Smoke test the installer
+        if: matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/smoke_windows.py \
+            --expected-version "$(python scripts/overlay.py build-version)" \
+            --installer release/netbird-enterprise-windows-amd64.exe
+
       # The installers are downloadable from here on, but nothing points at
       # them until latest.json is switched by the publish job.
       - name: Upload the signed installers
