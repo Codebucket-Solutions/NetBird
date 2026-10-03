@@ -126,22 +126,28 @@ def check_ui(ui: Path) -> None:
 
 
 def run_diagnostic_ui(ui: Path) -> None:
-    """Run a console-subsystem, non-production build with its output captured and report it."""
+    """Run a console-subsystem, non-production build several times with its output captured and report it."""
     console = Path(tempfile.gettempdir()) / "netbird-ui-diagnostic.console"
-    if console.exists():
-        console.unlink()
-    print(f"+ {ui} --log-level debug  (diagnostic build, output captured)", flush=True)
-    with console.open("wb") as handle:
-        process = subprocess.Popen([str(ui), "--log-level", "debug"], stdout=handle, stderr=subprocess.STDOUT)
-        time.sleep(UI_GRACE_SECONDS)
-        exited = process.poll()
-    if exited is None:
-        process.kill()
-        process.wait(timeout=30)
-    output = tail(console, 60)
-    state = "still running" if exited is None else f"exited with {exited}"
-    print(f"diagnostic build: {state}\n{output}", flush=True)
-    notice("Diagnostic UI output", f"{state}\n{output}")
+    report = []
+    for attempt in range(1, 5):
+        if console.exists():
+            console.unlink()
+        print(f"+ {ui} --log-level debug  (diagnostic build, attempt {attempt})", flush=True)
+        with console.open("wb") as handle:
+            process = subprocess.Popen([str(ui), "--log-level", "debug"], stdout=handle, stderr=subprocess.STDOUT)
+            time.sleep(UI_GRACE_SECONDS)
+            exited = process.poll()
+        if exited is None:
+            process.kill()
+            process.wait(timeout=30)
+        output = tail(console, 60)
+        state = "still running" if exited is None else f"exited with {exited}"
+        print(f"diagnostic build attempt {attempt}: {state}\n{output}", flush=True)
+        report.append(f"attempt {attempt}: {state}")
+        if exited is not None:
+            notice(f"Diagnostic UI attempt {attempt} exited", output)
+        time.sleep(3)
+    notice("Diagnostic UI attempts", "\n".join(report))
 
 
 def smoke(directory: Path, expected: str, diagnostic_ui: Path | None) -> None:
