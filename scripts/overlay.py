@@ -648,11 +648,13 @@ def require_newer_than_published(version: str, published_manifest: str | None) -
 
 
 def release_manifest(args: argparse.Namespace, overlay_root: Path) -> None:
-    """Write latest.json for the signed archives of the current release.
+    """Write latest.json for the signed installers of the current release.
 
     Clients read this file to learn which build is allowed to connect. The
-    archives are the ones read back from the bucket; each must match the
+    installers are the ones read back from the bucket; each must match the
     .sha256 written when it was signed, so the manifest describes signed bytes.
+    The NSIS installer is the artifact for a platform (what a client is told to
+    install); the MSI, for managed deployment, is listed under "<platform>-msi".
     """
     config = read_json(overlay_root / "overlay.config.json")
     version, release_tag = release_identity(overlay_root)
@@ -660,21 +662,23 @@ def release_manifest(args: argparse.Namespace, overlay_root: Path) -> None:
     require_newer_than_published(version, args.published_manifest)
 
     artifacts = []
-    for archive in sorted(Path(args.artifacts_directory).resolve().glob("netbird-enterprise-*.zip")):
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        signed_digest = archive.with_name(archive.name + ".sha256").read_text(encoding="ascii").split()[0]
+    directory = Path(args.artifacts_directory).resolve()
+    for installer in sorted([*directory.glob("netbird-enterprise-*.exe"), *directory.glob("netbird-enterprise-*.msi")]):
+        digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+        signed_digest = installer.with_name(installer.name + ".sha256").read_text(encoding="ascii").split()[0]
         if digest != signed_digest:
-            raise RuntimeError(f"{archive.name} does not match the checksum written at signing")
+            raise RuntimeError(f"{installer.name} does not match the checksum written at signing")
+        platform = installer.stem.removeprefix("netbird-enterprise-")
         artifacts.append(
             {
-                "platform": archive.stem.removeprefix("netbird-enterprise-"),
-                "url": f"{base_url}/releases/{release_tag}/{archive.name}",
+                "platform": platform if installer.suffix == ".exe" else f"{platform}-msi",
+                "url": f"{base_url}/releases/{release_tag}/{installer.name}",
                 "sha256": digest,
-                "size": archive.stat().st_size,
+                "size": installer.stat().st_size,
             }
         )
-    if not artifacts:
-        raise RuntimeError("no signed archives found for the release manifest")
+    if not any(artifact["platform"].count("-") == 1 for artifact in artifacts):
+        raise RuntimeError("no signed installers found for the release manifest")
 
     manifest = {
         "version": version,

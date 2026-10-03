@@ -4,9 +4,10 @@ name: Publish enterprise release
 # (for example v0.80.0-enterprise.0). The tag must match the lock and the
 # enterprise revision in overlay.config.json.
 #
-# Each architecture is built, signed and uploaded to the release bucket inside
-# one job. Nothing is stored as a workflow artifact: the bucket is the only
-# place a release exists, and latest.json is switched last.
+# Each architecture is built, signed, packaged into upstream's NSIS and MSI
+# installers, signed again and uploaded to the release bucket inside one job.
+# Nothing is stored as a workflow artifact: the bucket is the only place a
+# release exists, and latest.json is switched last.
 on:
   push:
     tags:
@@ -126,6 +127,82 @@ jobs:
             --input-directory "$(cygpath -u "$DISTRIBUTION")" \
             --output-directory signed
 
+      # Upstream's installer definitions (client/installer.nsis, client/netbird.wxs)
+      # are used unchanged over the signed binaries, so the enterprise build
+      # installs exactly like, and in place of, the official client: same
+      # service name, install directory, and MSI upgrade code.
+      - name: Stage the signed binaries, wintun, and installer tooling
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          source="$(cygpath -u '${{ runner.temp }}')/netbird-source"
+          stage="$source/dist/netbird_windows_${ARCH}"
+          mkdir -p "$stage" downloads
+          python -m zipfile -e "signed/netbird-enterprise-windows-${ARCH}.zip" "$stage"
+
+          python scripts/fetch.py https://pkgs.netbird.io/wintun/wintun-0.14.1.zip downloads/wintun.zip \
+            07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+          python -m zipfile -e downloads/wintun.zip downloads/wintun
+          cp "downloads/wintun/wintun/bin/${ARCH}/wintun.dll" "$stage/"
+
+          # NSIS plugins the installer script needs; makensis on the runner is the 32-bit Unicode build.
+          plugins="/c/Program Files (x86)/NSIS/Plugins/x86-unicode"
+          python scripts/fetch.py https://pkgs.netbird.io/nsis/EnVar_plugin.zip downloads/envar.zip \
+            e9aa92de351345ed82795251d838f1ae9041ba35af9d381a5780c7843b01f56a
+          python -m zipfile -e downloads/envar.zip downloads/envar
+          cp downloads/envar/Plugins/x86-unicode/EnVar.dll "$plugins/"
+          if [ "$ARCH" = amd64 ]; then
+            python scripts/fetch.py https://pkgs.netbird.io/nsis/ShellExecAsUser_amd64-Unicode.7z downloads/shellexecasuser.7z \
+              0a55ea25c7330a92cec028eda8afcaf1b1a7092e0dfb77c21c8f654564b4ff9d
+            "/c/Program Files/7-Zip/7z.exe" x -y -odownloads/shellexecasuser downloads/shellexecasuser.7z >/dev/null
+            find downloads/shellexecasuser -name '*.dll' -exec cp {} "$plugins/" \;
+          fi
+
+          # The WebView2 bootstrapper the installers carry for the UI.
+          (cd "$source" && wails3 generate webview2bootstrapper -dir client)
+
+      - name: Build the installers
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          source="$(cygpath -u '${{ runner.temp }}')/netbird-source"
+          version="$(python scripts/overlay.py build-version)"
+          upstream="${version%%+*}"
+          revision="${version##*.}"
+          mkdir -p release
+
+          # NSIS wants a four-part file version; the enterprise revision is the fourth.
+          (cd "$source" && APPVER="${upstream}.${revision}" \
+            "/c/Program Files (x86)/NSIS/makensis.exe" /V4 "/DARCH=${ARCH}" client/installer.nsis)
+          mv "$source/netbird-installer.exe" "release/netbird-enterprise-windows-${ARCH}.exe"
+
+          # The MSI carries the upstream version; same-version upgrades are allowed, so a
+          # new enterprise revision of the same upstream still installs over the previous one.
+          dotnet tool install --global wix --version 6.0.2 >/dev/null
+          wix extension add WixToolset.Util.wixext/6.0.2 >/dev/null
+          wix_arch=x64
+          if [ "$ARCH" = arm64 ]; then wix_arch=arm64; fi
+          (cd "$source" && NETBIRD_VERSION="$upstream" wix build -arch "$wix_arch" -ext WixToolset.Util.wixext \
+            -o "$(cygpath -w "$PWD/release/netbird-enterprise-windows-${ARCH}.msi")" ./client/netbird.wxs \
+            -d "ProcessorArchitecture=${wix_arch}" -d "ArchSuffix=${ARCH}")
+          ls -l release
+
+      - name: Sign and verify the installers
+        shell: bash
+        env:
+          CSCA1_CERT: ${{ secrets.CSCA1_CERT }}
+          CSCA1_KEY: ${{ secrets.CSCA1_KEY }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python scripts/sign_windows.py --files \
+            "release/netbird-enterprise-windows-${ARCH}.exe" \
+            "release/netbird-enterprise-windows-${ARCH}.msi"
+
       - name: Refuse to overwrite a published release
         if: ${{ !inputs.signing_test_only }}
         shell: bash
@@ -139,9 +216,9 @@ jobs:
             exit 1
           fi
 
-      # The archive is downloadable from here on, but nothing points at it
-      # until latest.json is switched by the publish job.
-      - name: Upload the signed archive
+      # The installers are downloadable from here on, but nothing points at
+      # them until latest.json is switched by the publish job.
+      - name: Upload the signed installers
         if: ${{ !inputs.signing_test_only }}
         shell: bash
         env:
@@ -149,8 +226,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          aws s3 cp signed "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" \
-            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
+          aws s3 cp release "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" \
+            --recursive --exclude '*' --include '*.exe' --include '*.msi' --include '*.sha256' --no-progress
 
   publish:
     name: Switch latest.json
@@ -182,7 +259,7 @@ jobs:
         run: |
           set -euo pipefail
           aws s3 cp "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" release-assets \
-            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
+            --recursive --exclude '*' --include '*.exe' --include '*.msi' --include '*.sha256' --no-progress
 
       - name: Build the release manifest
         shell: bash

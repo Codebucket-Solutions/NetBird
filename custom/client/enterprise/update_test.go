@@ -16,8 +16,8 @@ import (
 )
 
 const updateRequiredBody = `{"error":"CLIENT_UPDATE_REQUIRED","requiredVersion":"0.80.0+codebuckets.7","artifacts":[` +
-	`{"platform":"windows-amd64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-amd64.zip"},` +
-	`{"platform":"windows-arm64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-arm64.zip"}]}`
+	`{"platform":"windows-amd64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-amd64.exe"},` +
+	`{"platform":"windows-arm64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-arm64.exe"}]}`
 
 func TestRefusalNamesTheBuildToInstallAndWhereToGetIt(t *testing.T) {
 	gate := newUpdateGate("0.80.0+codebuckets.6")
@@ -33,7 +33,7 @@ func TestRefusalNamesTheBuildToInstallAndWhereToGetIt(t *testing.T) {
 	if status.Code(denial) != codes.FailedPrecondition {
 		t.Fatalf("denial = %v, want FailedPrecondition", denial)
 	}
-	wantURL := "https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-" + platformName() + ".zip"
+	wantURL := "https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-" + platformName() + ".exe"
 	for _, want := range []string{errUpdateRequired, "0.80.0+codebuckets.6", "0.80.0+codebuckets.7", wantURL} {
 		if !strings.Contains(denial.Error(), want) {
 			t.Errorf("denial %q does not mention %q", denial, want)

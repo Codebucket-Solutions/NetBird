@@ -296,12 +296,18 @@ def sign(args: argparse.Namespace) -> None:
     if not certificate_bundle.strip() or not private_key.strip():
         raise RuntimeError("CSCA1_CERT and CSCA1_KEY repository secrets are required")
 
-    input_directory = Path(args.input_directory).resolve()
-    output_directory = Path(args.output_directory).resolve()
-    archives = list(input_directory.glob("*.zip"))
-    if len(archives) != 1:
-        raise RuntimeError(f"Expected one Windows candidate archive, found {len(archives)}")
-    output_directory.mkdir(parents=True, exist_ok=True)
+    if args.files:
+        targets = [Path(file).resolve() for file in args.files]
+        missing = [str(path) for path in targets if not path.is_file()]
+        if missing:
+            raise RuntimeError("Files to sign do not exist: " + ", ".join(missing))
+    else:
+        input_directory = Path(args.input_directory).resolve()
+        archives = list(input_directory.glob("*.zip"))
+        if len(archives) != 1:
+            raise RuntimeError(f"Expected one Windows candidate archive, found {len(archives)}")
+        output_directory = Path(args.output_directory).resolve()
+        output_directory.mkdir(parents=True, exist_ok=True)
 
     certificate_blocks = [
         match.strip() for match in CERTIFICATE_PATTERN.findall(certificate_bundle)
@@ -373,14 +379,19 @@ def sign(args: argparse.Namespace) -> None:
             env=openssl_environment,
         )
 
-        expanded = temporary_path / "expanded"
-        expanded.mkdir()
-        safe_extract(archives[0], expanded)
-        executables = {path.name: path for path in expanded.glob("*.exe")}
-        if set(executables) != EXPECTED_EXECUTABLES:
-            raise RuntimeError(
-                "Unexpected Windows executable set: " + ", ".join(sorted(executables))
-            )
+        if args.files:
+            # Installers are signed in place; each gets a checksum file next to it.
+            to_sign = targets
+        else:
+            expanded = temporary_path / "expanded"
+            expanded.mkdir()
+            safe_extract(archives[0], expanded)
+            executables = {path.name: path for path in expanded.glob("*.exe")}
+            if set(executables) != EXPECTED_EXECUTABLES:
+                raise RuntimeError(
+                    "Unexpected Windows executable set: " + ", ".join(sorted(executables))
+                )
+            to_sign = sorted(executables.values())
 
         try:
             print("Installing the temporary machine verification chain", flush=True)
@@ -395,34 +406,46 @@ def sign(args: argparse.Namespace) -> None:
                     )
                 )
 
-            for executable in sorted(executables.values()):
-                sign_executable(signtool, pfx_path, pfx_password, executable)
-                print(f"Verifying {executable.name}", flush=True)
+            for target in to_sign:
+                sign_executable(signtool, pfx_path, pfx_password, target)
+                print(f"Verifying {target.name}", flush=True)
                 run(
-                    [str(signtool), "verify", "/pa", "/all", str(executable)],
+                    [str(signtool), "verify", "/pa", "/all", str(target)],
                     timeout_seconds=SIGNTOOL_TIMEOUT_SECONDS,
                 )
 
-            signed_archive = output_directory / archives[0].name
-            write_archive(expanded, signed_archive)
-            digest = hashlib.sha256(signed_archive.read_bytes()).hexdigest()
-            checksum = signed_archive.with_suffix(signed_archive.suffix + ".sha256")
-            checksum.write_text(
-                f"{digest}  {signed_archive.name}\n", encoding="ascii", newline="\n"
-            )
+            if args.files:
+                outputs = targets
+            else:
+                signed_archive = output_directory / archives[0].name
+                write_archive(expanded, signed_archive)
+                outputs = [signed_archive]
+            for output in outputs:
+                write_checksum(output)
         finally:
             remove_certificates(certutil, installed)
 
-    print(f"Signed and verified {len(EXPECTED_EXECUTABLES)} executables")
+    print(f"Signed and verified {len(to_sign)} files")
     print(f"Signing certificate SHA-1: {leaf_thumbprint}")
-    print(f"Created {signed_archive.name}")
+    for output in outputs:
+        print(f"Created {output.name}")
+
+
+def write_checksum(path: Path) -> None:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum = path.with_name(path.name + ".sha256")
+    checksum.write_text(f"{digest}  {path.name}\n", encoding="ascii", newline="\n")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-directory", required=True)
-    parser.add_argument("--output-directory", required=True)
-    return parser.parse_args()
+    parser.add_argument("--input-directory", help="directory holding one candidate zip of unsigned executables")
+    parser.add_argument("--output-directory", help="where the signed zip and its checksum are written")
+    parser.add_argument("--files", nargs="+", help="installers to sign in place instead of a candidate zip")
+    args = parser.parse_args()
+    if bool(args.files) == bool(args.input_directory and args.output_directory):
+        parser.error("give either --files, or --input-directory with --output-directory")
+    return args
 
 
 if __name__ == "__main__":

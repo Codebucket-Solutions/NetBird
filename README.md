@@ -118,8 +118,10 @@ it.
   candidates entirely on Windows runners, then throws them away. There is no
   Linux or macOS job.
 - `release.yml` builds each architecture again with the fleet token,
-  Authenticode-signs it and uploads it to the release bucket, all inside one
-  job, and then switches `latest.json` to the new version. It starts from the
+  Authenticode-signs the executables, packages them with upstream's
+  `client/installer.nsis` and `client/netbird.wxs`, signs the installers and
+  uploads them to the release bucket, all inside one job, and then switches
+  `latest.json` to the new version. It starts from the
   Actions tab or by pushing the release tag, for example
   `v0.80.0-enterprise.0`. It creates no GitHub release. A signing-only test
   run uploads nothing.
@@ -133,8 +135,14 @@ release exists.
 Releases are served from `https://netbird-client.download.codebuckets.in`:
 
 - `latest.json` names the only version that is allowed to connect, with the
-  download URL and SHA-256 of each archive.
-- `releases/<tag>/` holds the signed archives of one release and is never
+  download URL and SHA-256 of each installer: `netbird-enterprise-windows-<arch>.exe`
+  (upstream's NSIS installer, listed under the platform `windows-<arch>`) and
+  `netbird-enterprise-windows-<arch>.msi` (for Intune or other managed
+  deployment, listed as `windows-<arch>-msi`). Both carry the signed
+  `netbird.exe`, `netbird-ui.exe` and `wintun.dll`, install the service, and
+  replace an official client in place: same install directory, service name,
+  and MSI upgrade code.
+- `releases/<tag>/` holds the signed installers of one release and is never
   overwritten.
 
 Publishing a release makes every older build stop working. Engineering Fabric
@@ -153,7 +161,7 @@ reads `latest.json` and is the only authority the client listens to:
 A release must be newer than the published one; `scripts/overlay.py
 release-preflight` refuses anything else before building, and
 `release-manifest` checks again against the bucket before switching
-`latest.json`. The manifest is built from the archives read back from the
+`latest.json`. The manifest is built from the installers read back from the
 bucket, each checked against the SHA-256 written when it was signed.
 
 The server side of the contract, including admission and rollout, is described

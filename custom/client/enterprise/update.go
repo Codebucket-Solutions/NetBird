@@ -14,7 +14,7 @@ import (
 
 const (
 	// releaseBaseURL is where enterprise builds are published. It is shown
-	// to the user when the policy server names no archive for this platform.
+	// to the user when the policy server names no installer for this platform.
 	releaseBaseURL = "https://netbird-client.download.codebuckets.in"
 
 	errUpdateRequired = "ENTERPRISE_UPDATE_REQUIRED"
