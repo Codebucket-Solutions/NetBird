@@ -69,52 +69,56 @@ def notice(title: str, message: str) -> None:
 
 
 def check_ui(ui: Path) -> None:
-    """Start the UI twice: the way Explorer does, and with its output captured.
+    """Start the UI the ways it is started in practice and require it to stay up.
 
-    A windowsgui binary launched by a double-click or the installer gets no
-    console and no standard handles; that launch is the one users see. The
-    captured launch is for diagnosis: the Wails runtime reports a fatal error
-    on stderr, not through the log file.
+    Explorer and the installer start a windowsgui binary with no console and no
+    standard handles; a console starts it with inherited handles. Each variant
+    is run on its own, with the UI log read after it, and one variant keeps
+    its console output in a file, because the Wails runtime reports a fatal
+    error on stderr rather than through the log file.
     """
     log = Path(tempfile.gettempdir()) / "netbird-ui-smoke.log"
     console = Path(tempfile.gettempdir()) / "netbird-ui-smoke.console"
-    for path in (log, console):
-        if path.exists():
-            path.unlink()
     command = [str(ui), "--log-file", str(log), "--log-level", "debug"]
-
-    print(f"+ {' '.join(command)}  (detached, no standard handles)", flush=True)
-    detached = subprocess.Popen(command, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
-    time.sleep(UI_GRACE_SECONDS)
-    detached_exit = detached.poll()
-    detached_log = tail(log, 60)
-    if detached_exit is None:
-        detached.kill()
-        detached.wait(timeout=30)
-    print(f"detached launch: {'still running' if detached_exit is None else f'exited with {detached_exit}'}\n{detached_log}", flush=True)
-    time.sleep(3)
-
-    print(f"+ {' '.join(command)}  (output captured)", flush=True)
-    with console.open("wb") as handle:
-        captured = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
-        time.sleep(UI_GRACE_SECONDS)
-        captured_exit = captured.poll()
-    captured_output = "--- ui log ---\n" + tail(log, 60) + "\n--- ui console ---\n" + tail(console, 40)
-    if captured_exit is None:
-        captured.kill()
-        captured.wait(timeout=30)
-    print(f"captured launch: {'still running' if captured_exit is None else f'exited with {captured_exit}'}\n{captured_output}", flush=True)
-    notice("UI console output", f"detached launch: {'running' if detached_exit is None else f'exit {detached_exit}'}; "
-           f"captured launch: {'running' if captured_exit is None else f'exit {captured_exit}'}\n{captured_output}")
-
-    if detached_exit is not None:
-        raise RuntimeError(f"netbird-ui.exe exited with {detached_exit} within {UI_GRACE_SECONDS}s when launched without standard handles\n"
-                           f"--- ui log (detached) ---\n{detached_log}\n{captured_output}")
-    if captured_exit is not None:
-        raise RuntimeError(f"netbird-ui.exe exited with {captured_exit} within {UI_GRACE_SECONDS}s\n{captured_output}")
-    if "tray applyIcon" not in detached_log:
-        raise RuntimeError("netbird-ui.exe is running but never set up its tray icon\n" + detached_log)
-    print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s both ways and set up its tray icon")
+    detached = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    report = []
+    failures = []
+    for name, kwargs in (
+        ("detached, no standard handles", {"creationflags": detached, "close_fds": True}),
+        ("detached, output to a file", {"creationflags": detached, "close_fds": True, "capture": True}),
+        ("inherited handles", {}),
+    ):
+        for path in (log, console):
+            if path.exists():
+                path.unlink()
+        capture = kwargs.pop("capture", False)
+        print(f"+ {' '.join(command)}  ({name})", flush=True)
+        handle = console.open("wb") if capture else None
+        try:
+            process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT if capture else None, **kwargs)
+            time.sleep(UI_GRACE_SECONDS)
+            exited = process.poll()
+        finally:
+            if handle:
+                handle.close()
+        if exited is None:
+            process.kill()
+            process.wait(timeout=30)
+        output = "--- ui log ---\n" + tail(log, 40)
+        if capture:
+            output += "\n--- ui console ---\n" + tail(console, 40)
+        state = "still running" if exited is None else f"exited with {exited}"
+        print(f"{name}: {state}\n{output}", flush=True)
+        report.append(f"{name}: {state}")
+        if exited is not None:
+            failures.append(f"{name}: exited with {exited}\n{output}")
+        elif "tray applyIcon" not in output:
+            failures.append(f"{name}: running but never set up its tray icon\n{output}")
+        time.sleep(3)
+    notice("UI launch variants", "\n".join(report) + "\n--- ui console (detached, file) ---\n" + tail(console, 40))
+    if failures:
+        raise RuntimeError("netbird-ui.exe did not stay up for every launch variant\n" + "\n\n".join(failures))
+    print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s in every launch variant and set up its tray icon")
 
 
 def smoke(directory: Path, expected: str) -> None:
