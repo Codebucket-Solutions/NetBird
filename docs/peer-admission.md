@@ -6,8 +6,8 @@ rollout; admission starts read-only. Decision 2026-09-04 (two groups), revised
 Engineering Fabric, no management-server fork) and 2026-10-02 (the client sends
 only its NetBird IP and serial; no policy revisions; no force-disconnect
 notification). The server side is described in `NETBIRD.md` in the Engineering
-Fabric repository; the client wire contract is
-[`../policy/client-policy.schema.json`](../policy/client-policy.schema.json).
+Fabric repository, together with the wire contract (`docs/API_REFERENCE.md`
+there); the client side is `custom/client/enterprise`.
 
 ## Decision
 
@@ -151,8 +151,7 @@ with exactly two fields:
 
 ## What the client receives
 
-HTTP 200 with a policy; the full contract is
-[`../policy/client-policy.schema.json`](../policy/client-policy.schema.json):
+HTTP 200 with a policy:
 
 ```json
 {
@@ -183,7 +182,7 @@ HTTP 200 with a policy; the full contract is
   device neither rejects a valid policy nor stretches its lease.
 - HTTP 426 (`CLIENT_UPDATE_REQUIRED`) means this build is older than the
   latest release. The body names `requiredVersion` and the download `url` per
-  platform (`$defs.updateRequired` in the schema); the client disconnects,
+  platform; the client disconnects,
   refuses to connect or log in, shows the user that version and link, and
   keeps polling so it notices when it is served a policy again.
 - Any other status carries `{"error":"CODE"}`; the client reads only the status

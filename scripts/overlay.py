@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -37,7 +36,6 @@ CUSTOM_SOURCE_PATTERNS = (
 )
 # Policy controls implemented by the enterprise wrapper itself. Every other
 # control key must be a native MDM key of the locked upstream release.
-ENTERPRISE_CONTROL_KEYS = {"keepConnected", "disableQuit"}
 
 
 def run(
@@ -109,11 +107,12 @@ def require_schema(lock: dict[str, Any], config: dict[str, Any]) -> None:
 
 
 def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: str) -> None:
+    """Check the enterprise sources against the upstream they are built on and the configured contract.
+
+    The wire contract itself is owned by Engineering Fabric; what can drift here is
+    the set of native MDM keys the enterprise registry names.
+    """
     config = read_json(overlay_root / "overlay.config.json")
-    schema = read_json(overlay_root / "policy" / "client-policy.schema.json")
-    policy_path = urllib.parse.urlsplit(str(config["policy_url"])).path
-    if f"POST {policy_path}" not in str(schema.get("description", "")):
-        raise RuntimeError(f"policy JSON schema does not describe {policy_path}")
 
     mdm_source = (source / "client" / "mdm" / "policy.go").read_text(encoding="utf-8")
     native_source_constants = dict(
@@ -131,14 +130,6 @@ def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: st
     unknown_constants = sorted(registry_constants - set(native_source_constants))
     if unknown_constants:
         raise RuntimeError(f"enterprise native-control registry has unknown constants: {unknown_constants}")
-    go_control_keys = {native_source_constants[name] for name in registry_constants} | ENTERPRISE_CONTROL_KEYS
-    schema_control_keys = set(schema.get("properties", {}).get("controls", {}).get("properties", {}))
-    if go_control_keys != schema_control_keys:
-        raise RuntimeError(
-            "policy schema and enterprise control registry differ "
-            f"(Go={sorted(go_control_keys)}, JSON={sorted(schema_control_keys)})"
-        )
-
     # Regular expressions rather than literals: gofmt re-aligns these
     # declarations whenever a neighbouring name changes length.
     revision = re.escape(str(config["enterprise_revision"]))
@@ -497,7 +488,6 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
         print_result(verify_source(destination, overlay_root, args.require_enterprise_hook))
 
     manifest_path = overlay_root / "patches" / "manifest.sha256"
-    policy_contract_path = overlay_root / "policy" / "client-policy.schema.json"
     overlay_head = run("git", "rev-parse", "--verify", "HEAD", cwd=overlay_root, check=False)
     provenance = {
         "schema_version": 1,
@@ -509,7 +499,6 @@ def materialize(args: argparse.Namespace, overlay_root: Path) -> None:
         "patch_count": len(patch_entries),
         "custom_source_sha256": custom_source_sha256,
         "custom_file_count": len(custom_inventory),
-        "policy_contract_sha256": hashlib.sha256(policy_contract_path.read_bytes()).hexdigest(),
         "source_head": run("git", "rev-parse", "HEAD", cwd=destination).stdout.strip(),
         "source_tree": run("git", "rev-parse", "HEAD^{tree}", cwd=destination).stdout.strip(),
         "materialized_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

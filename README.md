@@ -25,7 +25,8 @@ desktop tray's Quit handler. All policy, enforcement, polling, and UI guard
 logic is maintained as ordinary Go source under `custom/client`, outside the
 patch.
 
-The machine-readable API contract lives in `policy/client-policy.schema.json`.
+The wire contract is owned by Engineering Fabric (`docs/API_REFERENCE.md` and
+`NETBIRD.md` there); the client side of it is `custom/client/enterprise`.
 A policy response carries a `policyId`, a `validUntil` lease, one flat
 `controls` object of booleans (`keepConnected`, `disableQuit`, and five keys
 that exactly match native MDM names), and an `exitNode` policy. Exit nodes
@@ -35,8 +36,8 @@ control a response omits, so the server can add controls without breaking
 deployed clients; strict behavior is also used when no valid policy is
 available. There is no schema version and no policy revision: a newly accepted
 response replaces the previous one, and replay is bounded by `validUntil`.
-Qualification compares the control keys in the JSON schema, the Go enforcement
-registry, and upstream MDM constants so they cannot drift.
+Qualification checks the Go enforcement registry against the upstream MDM
+constants, so an upstream rename cannot go unnoticed.
 
 Peer admission is implemented in Engineering Fabric and is switched off there
 until rollout. Two NetBird groups define the
