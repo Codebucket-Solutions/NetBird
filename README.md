@@ -130,17 +130,18 @@ Releases are served from `https://netbird-client.download.codebuckets.in`:
 - `releases/<tag>/` holds the signed archives of one release and is never
   overwritten.
 
-Publishing a release makes every older build stop working:
+Publishing a release makes every older build stop working. Engineering Fabric
+reads `latest.json` and is the only authority the client listens to:
 
-- The daemon reads `latest.json` when it starts and every five minutes. When a
-  newer version is published it disconnects and refuses to connect or log in;
-  the error tells the user which version to install and where to get it. When
-  the manifest cannot be read the daemon keeps what it last knew, so an
-  unreachable download host does not take the fleet offline.
-- Engineering Fabric refuses the policy poll of an outdated build with HTTP
-  426, which the daemon treats the same way, and does not admit an outdated
-  peer to the network. That refusal, not the client's own check, is what makes
-  the rule hold for a build that never asks.
+- Engineering Fabric answers the policy poll of an older build with HTTP 426.
+  The answer names the required version and the download link for the
+  device's platform. The daemon then disconnects and refuses to connect or log
+  in; the error shows the user the version to install and the link. It keeps
+  polling, so it notices when the server accepts it again.
+- Engineering Fabric also stops admitting an outdated peer to the network, so
+  a build that never asks is cut off as well.
+- People get the link from Engineering Fabric (`GET /api/v1/netbird/download`,
+  any signed-in user). The daemon reads no manifest of its own.
 
 A release must be newer than the published one; `scripts/overlay.py
 release-manifest` refuses anything else.

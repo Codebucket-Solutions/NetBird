@@ -5,10 +5,8 @@ package enterprise
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,162 +15,60 @@ import (
 	"github.com/netbirdio/netbird/client/proto"
 )
 
-func TestBuildVersionOrder(t *testing.T) {
-	for _, test := range []struct {
-		older, newer string
-	}{
-		{older: "0.80.0+codebuckets.6", newer: "0.80.0+codebuckets.7"},
-		{older: "0.80.0+codebuckets.9", newer: "0.80.0+codebuckets.10"},
-		{older: "0.80.9+codebuckets.9", newer: "0.81.0+codebuckets.1"},
-		{older: "0.99.0+codebuckets.3", newer: "1.0.0+codebuckets.1"},
-	} {
-		older, okOlder := parseBuildVersion(test.older)
-		newer, okNewer := parseBuildVersion(test.newer)
-		if !okOlder || !okNewer {
-			t.Fatalf("parse %q and %q: %t, %t", test.older, test.newer, okOlder, okNewer)
-		}
-		if !older.olderThan(newer) || newer.olderThan(older) || older.olderThan(older) {
-			t.Errorf("%s must be older than %s, and no version older than itself", test.older, test.newer)
-		}
+const updateRequiredBody = `{"error":"CLIENT_UPDATE_REQUIRED","requiredVersion":"0.80.0+codebuckets.7","artifacts":[` +
+	`{"platform":"windows-amd64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-amd64.zip"},` +
+	`{"platform":"windows-arm64","url":"https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-windows-arm64.zip"}]}`
+
+func TestRefusalNamesTheBuildToInstallAndWhereToGetIt(t *testing.T) {
+	gate := newUpdateGate("0.80.0+codebuckets.6")
+	if gate.denial() != nil || gate.requiredVersion() != "" {
+		t.Fatal("a build that was never refused is told to update")
 	}
 
-	for _, unusable := range []string{"", "development", "0.80.0", "0.80+codebuckets.1", "0.80.0+codebuckets.", "0.80.0+other.1", "0.x.0+codebuckets.1", "0.80.0+codebuckets.-1"} {
-		if _, ok := parseBuildVersion(unusable); ok {
-			t.Errorf("parseBuildVersion(%q) succeeded, want it refused", unusable)
-		}
-	}
-}
-
-// newTestGate returns a gate for the given build that reads its manifest from a
-// test server, and a function that sets what that server answers.
-func newTestGate(t *testing.T, current string) (*updateGate, func(status int, body string)) {
-	t.Helper()
-	answer := struct {
-		status int
-		body   string
-	}{status: http.StatusOK, body: `{"version":"` + current + `"}`}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(answer.status)
-		_, _ = writer.Write([]byte(answer.body))
-	}))
-	t.Cleanup(server.Close)
-
-	gate := newUpdateGate(current, server.Client(), func() time.Time { return fixedNow })
-	gate.manifestURL = server.URL
-	return gate, func(status int, body string) {
-		answer.status = status
-		answer.body = body
-	}
-}
-
-func TestNewerReleaseRequiresAnUpdate(t *testing.T) {
-	gate, answer := newTestGate(t, "0.80.0+codebuckets.6")
-
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if gate.requiredVersion() != "" || gate.denial() != nil {
-		t.Fatalf("the latest build was told to update to %q", gate.requiredVersion())
-	}
-
-	answer(http.StatusOK, `{"version":"0.80.0+codebuckets.7","publishedAt":"2026-10-02T15:00:00Z"}`)
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
+	gate.require([]byte(updateRequiredBody))
 	if got := gate.requiredVersion(); got != "0.80.0+codebuckets.7" {
-		t.Fatalf("required version = %q, want the newer release", got)
+		t.Fatalf("required version = %q, want the version the server named", got)
 	}
 	denial := gate.denial()
 	if status.Code(denial) != codes.FailedPrecondition {
 		t.Fatalf("denial = %v, want FailedPrecondition", denial)
 	}
-	for _, want := range []string{errUpdateRequired, "0.80.0+codebuckets.6", "0.80.0+codebuckets.7", releaseBaseURL} {
+	wantURL := "https://netbird-client.download.codebuckets.in/releases/v0.80.0-enterprise.7/netbird-enterprise-" + platformName() + ".zip"
+	for _, want := range []string{errUpdateRequired, "0.80.0+codebuckets.6", "0.80.0+codebuckets.7", wantURL} {
 		if !strings.Contains(denial.Error(), want) {
 			t.Errorf("denial %q does not mention %q", denial, want)
 		}
 	}
 
-	// A manifest that names this build again, or an older one, lifts the requirement.
-	answer(http.StatusOK, `{"version":"0.80.0+codebuckets.5"}`)
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if gate.requiredVersion() != "" {
-		t.Fatalf("required version = %q after the manifest named an older build", gate.requiredVersion())
+	gate.clear()
+	if gate.denial() != nil {
+		t.Fatal("a build the server serves again is still told to update")
 	}
 }
 
-func TestUnreadableManifestKeepsWhatWasKnown(t *testing.T) {
-	gate, answer := newTestGate(t, "0.80.0+codebuckets.6")
-	answer(http.StatusOK, `{"version":"0.81.0+codebuckets.1"}`)
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-
-	for name, broken := range map[string]struct {
-		status int
-		body   string
-	}{
-		"server error":      {status: http.StatusInternalServerError, body: `{}`},
-		"not JSON":          {status: http.StatusOK, body: `<html>`},
-		"unusable version":  {status: http.StatusOK, body: `{"version":"latest"}`},
-		"oversized":         {status: http.StatusOK, body: `{"version":"0.80.0+codebuckets.6"}` + strings.Repeat(" ", maxManifestBodyBytes)},
-		"development build": {status: http.StatusOK, body: `{"version":"development"}`},
+func TestRefusalWithoutAUsableBodyStillBlocksAndPointsAtTheDownloadHost(t *testing.T) {
+	for name, body := range map[string][]byte{
+		"empty":           nil,
+		"not JSON":        []byte("<html>"),
+		"code only":       []byte(`{"error":"CLIENT_UPDATE_REQUIRED"}`),
+		"other platform":  []byte(`{"requiredVersion":"0.80.0+codebuckets.7","artifacts":[{"platform":"plan9-mips","url":"https://example.invalid/x.zip"}]}`),
+		"missing version": []byte(`{"artifacts":[]}`),
 	} {
-		answer(broken.status, broken.body)
-		if err := gate.refresh(context.Background()); err == nil {
-			t.Errorf("%s: refresh succeeded, want an error", name)
+		gate := newUpdateGate("0.80.0+codebuckets.6")
+		gate.require(body)
+		denial := gate.denial()
+		if denial == nil {
+			t.Fatalf("%s: no denial after a refusal", name)
 		}
-		if got := gate.requiredVersion(); got != "0.81.0+codebuckets.1" {
-			t.Errorf("%s: required version = %q, want the last definite answer kept", name, got)
+		if !strings.Contains(denial.Error(), releaseBaseURL) {
+			t.Errorf("%s: denial %q does not point at the download host", name, denial)
 		}
-	}
-}
-
-func TestDevelopmentBuildIsOutsideTheReleaseOrder(t *testing.T) {
-	gate, answer := newTestGate(t, "development")
-	answer(http.StatusOK, `{"version":"9.9.9+codebuckets.9"}`)
-
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if gate.requiredVersion() != "" {
-		t.Fatalf("a development build was told to update to %q", gate.requiredVersion())
-	}
-}
-
-func TestManifestIsReadOncePerInterval(t *testing.T) {
-	requests := 0
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		requests++
-		_, _ = writer.Write([]byte(`{"version":"0.80.0+codebuckets.6"}`))
-	}))
-	t.Cleanup(server.Close)
-	now := fixedNow
-	gate := newUpdateGate("0.80.0+codebuckets.6", server.Client(), func() time.Time { return now })
-	gate.manifestURL = server.URL
-
-	gate.refreshIfDue(context.Background())
-	gate.refreshIfDue(context.Background())
-	now = now.Add(releaseCheckInterval - time.Second)
-	gate.refreshIfDue(context.Background())
-	if requests != 1 {
-		t.Fatalf("manifest requests = %d, want 1 inside the interval", requests)
-	}
-	now = now.Add(time.Second)
-	gate.refreshIfDue(context.Background())
-	if requests != 2 {
-		t.Fatalf("manifest requests = %d, want 2 once the interval has passed", requests)
 	}
 }
 
 func TestOutdatedBuildIsDisconnectedAndCannotConnect(t *testing.T) {
-	gate, answer := newTestGate(t, "0.80.0+codebuckets.6")
-	answer(http.StatusOK, `{"version":"0.80.0+codebuckets.7"}`)
-	if err := gate.refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
+	gate := newUpdateGate("0.80.0+codebuckets.6")
+	gate.require([]byte(updateRequiredBody))
 
 	raw := &fakeLifecycleServer{status: string(internal.StatusConnected)}
 	controller := controllerWithPolicy(raw, validPolicy(nil))
@@ -202,23 +98,35 @@ func TestOutdatedBuildIsDisconnectedAndCannotConnect(t *testing.T) {
 	}
 }
 
-func TestPolicyServerRefusalMarksTheBuildOutdated(t *testing.T) {
-	controller, calls := newPollingController(t, func(writer http.ResponseWriter, _ *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		writer.WriteHeader(http.StatusUpgradeRequired)
-		_, _ = writer.Write([]byte(`{"error":"CLIENT_UPDATE_REQUIRED"}`))
+func TestPolicyServerRefusalMarksTheBuildOutdatedUntilItIsServedAgain(t *testing.T) {
+	refuse := true
+	controller, calls := newPollingController(t, func(writer http.ResponseWriter, request *http.Request) {
+		if refuse {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusUpgradeRequired)
+			_, _ = writer.Write([]byte(updateRequiredBody))
+			return
+		}
+		servePolicy(policyBody(`{}`))(writer, request)
 	})
 
 	if err := controller.poll(context.Background()); err == nil {
 		t.Fatal("a refused poll succeeded")
 	}
-	if got := controller.updates.requiredVersion(); got != latestRelease {
+	if got := controller.updates.requiredVersion(); got != "0.80.0+codebuckets.7" {
 		t.Fatalf("required version = %q, want the build marked outdated", got)
 	}
 
-	// Once outdated, the loop stops asking the policy server.
+	// The build keeps asking, so it notices when the server accepts it again.
 	controller.pollAndReconcile(context.Background())
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("policy server calls = %d, want no further poll from an outdated build", got)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("policy server calls = %d, want the outdated build to keep polling", got)
+	}
+	refuse = false
+	if err := controller.poll(context.Background()); err != nil {
+		t.Fatalf("poll once served again: %v", err)
+	}
+	if controller.updates.requiredVersion() != "" {
+		t.Fatal("a build the server serves again is still marked outdated")
 	}
 }

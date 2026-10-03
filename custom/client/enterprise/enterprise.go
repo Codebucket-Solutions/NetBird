@@ -222,7 +222,7 @@ func newPolicyController(raw LifecycleServer, certificate *tls.Certificate) *pol
 		endpoint:   policyURL,
 		httpClient: httpClient,
 		now:        time.Now,
-		updates:    newUpdateGate(version.NetbirdVersion(), httpClient, time.Now),
+		updates:    newUpdateGate(version.NetbirdVersion()),
 	}
 }
 
@@ -241,12 +241,8 @@ func (p *policyController) run(ctx context.Context) {
 }
 
 func (p *policyController) pollAndReconcile(ctx context.Context) {
-	p.updates.refreshIfDue(ctx)
-	// An outdated build is refused by the policy server, so there is nothing to ask for.
-	if p.updates.requiredVersion() == "" {
-		if err := p.poll(ctx); err != nil {
-			p.logFailure(err)
-		}
+	if err := p.poll(ctx); err != nil {
+		p.logFailure(err)
 	}
 	p.reconcile(ctx)
 }
@@ -286,7 +282,10 @@ func (p *policyController) poll(ctx context.Context) error {
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusUpgradeRequired {
-		p.updates.refuseOutdated()
+		// The answer names the build to install and where to get it.
+		refusal, _ := io.ReadAll(io.LimitReader(response.Body, maxPolicyBodyBytes))
+		p.updates.require(refusal)
+		return errors.New("policy server requires a newer enterprise build")
 	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("policy server returned HTTP %d", response.StatusCode)
@@ -321,6 +320,7 @@ func (p *policyController) poll(ctx context.Context) error {
 	if err := p.accept(candidate, now); err != nil {
 		return fmt.Errorf("reject policy response: %w", err)
 	}
+	p.updates.clear()
 	return nil
 }
 
