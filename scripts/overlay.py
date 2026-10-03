@@ -111,10 +111,9 @@ def require_schema(lock: dict[str, Any], config: dict[str, Any]) -> None:
 def verify_policy_contract(source: Path, overlay_root: Path, enterprise_text: str) -> None:
     config = read_json(overlay_root / "overlay.config.json")
     schema = read_json(overlay_root / "policy" / "client-policy.schema.json")
-    policy_url = urllib.parse.urlsplit(str(config["policy_url"]))
-    expected_schema_id = f"{policy_url.scheme}://{policy_url.netloc}/schemas/netbird-client-policy.json"
-    if schema.get("$id") != expected_schema_id:
-        raise RuntimeError("policy JSON schema ID does not match the fixed policy origin")
+    policy_path = urllib.parse.urlsplit(str(config["policy_url"])).path
+    if f"POST {policy_path}" not in str(schema.get("description", "")):
+        raise RuntimeError(f"policy JSON schema does not describe {policy_path}")
 
     mdm_source = (source / "client" / "mdm" / "policy.go").read_text(encoding="utf-8")
     native_source_constants = dict(

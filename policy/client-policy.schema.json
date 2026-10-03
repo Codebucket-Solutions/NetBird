@@ -1,17 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://api.engineering-fabric.codebuckets.in/schemas/netbird-client-policy.json",
+  "$id": "https://raw.githubusercontent.com/Codebucket-Solutions/NetBird/main/policy/client-policy.schema.json",
   "title": "CodeBuckets NetBird client policy response",
-  "description": "HTTP 200 body of POST /api/v1/netbird/client/policy. The request body is $defs.policyRequest. Any other status carries {\"error\":\"CODE\"}; the client reads only the status code. Forward compatibility: clients ignore unknown top-level fields and unknown control keys, and apply their strict default to a known control that is absent, so the server can add fields and controls without breaking deployed clients.",
+  "description": "HTTP 200 body of POST /api/v1/netbird/client/policy on the policy origin in overlay.config.json. The request body is $defs.policyRequest. HTTP 426 carries $defs.updateRequired: the build is older than the latest release and must be replaced. Any other status carries {\"error\":\"CODE\"}; the client reads only the status code. Forward compatibility: clients ignore unknown top-level fields and unknown control keys, and apply their strict default to a known control that is absent, so the server can add fields and controls without breaking deployed clients.",
   "type": "object",
   "additionalProperties": true,
   "required": ["policyId", "validUntil", "controls", "exitNode"],
   "properties": {
-    "policyId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "policyId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "The profile key and its version, for example engineering-always-on:v7."
+    },
     "validUntil": {
       "type": "string",
       "format": "date-time",
-      "description": "End of the lease. The client rejects a value that is not in the future or is more than 15 minutes ahead, and returns to strict defaults once it passes without a newer accepted response. There is no revision; replay is bounded by this lease."
+      "description": "End of the lease, at most ten minutes after the response's Date header. The client rejects a value that is not in the future or is more than 15 minutes ahead, and returns to strict defaults once it passes without a newer accepted response. There is no revision; replay is bounded by this lease."
     },
     "controls": {
       "type": "object",
@@ -58,17 +63,47 @@
         "netbirdIp": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 45,
+          "pattern": "^[0-9a-fA-F:.]+$",
           "description": "The local peer's NetBird IP without a prefix length. The client sends no request while it has none."
         },
         "serialNumber": {
           "type": "string",
+          "minLength": 1,
           "maxLength": 256,
-          "description": "Trimmed system serial number. It must equal the serial the NetBird management server recorded for the peer."
+          "description": "Trimmed system serial number. It must equal the serial the NetBird management server recorded for the peer. A device without a serial is refused with 400 and stays unadmitted."
+        }
+      }
+    },
+    "updateRequired": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["error", "requiredVersion", "artifacts"],
+      "description": "HTTP 426 body. The client stops connecting, shows requiredVersion and the url of the artifact whose platform is its GOOS-GOARCH, and keeps polling until it is served a policy again.",
+      "properties": {
+        "error": { "const": "CLIENT_UPDATE_REQUIRED" },
+        "requiredVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\+codebuckets\\.[0-9]+$",
+          "description": "The version the latest release reports, for example 0.80.0+codebuckets.0."
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["platform", "url", "sha256"],
+            "properties": {
+              "platform": { "type": "string", "examples": ["windows-amd64", "windows-arm64"] },
+              "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
         }
       }
     }
   },
   "x-request-schema": { "$ref": "#/$defs/policyRequest" },
+  "x-update-required-schema": { "$ref": "#/$defs/updateRequired" },
   "examples": [
     {
       "policyId": "engineering-always-on:v7",

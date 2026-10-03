@@ -181,6 +181,11 @@ HTTP 200 with a policy; the full contract is
   a lease that has passed or reaches more than 15 minutes ahead. The lease is
   measured against the `Date` header of the response, so a wrong clock on the
   device neither rejects a valid policy nor stretches its lease.
+- HTTP 426 (`CLIENT_UPDATE_REQUIRED`) means this build is older than the
+  latest release. The body names `requiredVersion` and the download `url` per
+  platform (`$defs.updateRequired` in the schema); the client disconnects,
+  refuses to connect or log in, shows the user that version and link, and
+  keeps polling so it notices when it is served a policy again.
 - Any other status carries `{"error":"CODE"}`; the client reads only the status
   code, keeps its last accepted policy until that lease ends, and then enforces
   strict defaults.
