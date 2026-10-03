@@ -1,0 +1,125 @@
+name: Build Windows enterprise candidate
+description: >
+  Reconstruct the locked upstream source, apply the overlay and build the
+  daemon and UI for one Windows architecture. Nothing leaves the job: the
+  release workflow signs and uploads the output itself, so no build is ever
+  stored as a workflow artifact.
+
+inputs:
+  arch:
+    description: Windows architecture, amd64 or arm64
+    required: true
+  fleet_token:
+    description: Fleet token linked into the daemon; only the release workflow passes one
+    required: false
+    default: ''
+  run_tests:
+    description: Run the enterprise test suites before building
+    required: false
+    default: 'false'
+
+outputs:
+  distribution:
+    description: Directory holding netbird-enterprise-windows-<arch>.zip and its .sha256
+    value: ${{ steps.build.outputs.distribution }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.13'
+
+    - name: Reconstruct locked source
+      shell: bash
+      run: |
+        set -euo pipefail
+        temp_dir="$(cygpath -u '${{ runner.temp }}')"
+        python scripts/overlay.py materialize \
+          --destination "$temp_dir/netbird-source" \
+          --require-enterprise-hook
+
+    - name: Set up Go from locked source
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: ${{ runner.temp }}/netbird-source/go.mod
+        cache: false
+
+    - name: Set up Node.js
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '22'
+
+    - name: Set up pnpm
+      uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      with:
+        version: '11.4.0'
+        run_install: false
+
+    - name: Test enterprise controls
+      if: inputs.run_tests == 'true'
+      working-directory: ${{ runner.temp }}/netbird-source
+      shell: bash
+      run: |
+        set -euo pipefail
+        go test -tags enterprise ./client/enterprise/...
+        go test -tags enterprise ./client/ui/services
+        go test -run '^$' -tags enterprise ./client/cmd
+        go test -run '^$' ./client/cmd
+
+    - name: Install Wails CLI matching the locked module graph
+      working-directory: ${{ runner.temp }}/netbird-source
+      shell: bash
+      run: |
+        set -euo pipefail
+        wails_version="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)"
+        go install "github.com/wailsapp/wails/v3/cmd/wails3@${wails_version}"
+
+    - name: Build daemon and UI
+      id: build
+      working-directory: ${{ runner.temp }}/netbird-source
+      shell: bash
+      env:
+        TARGET_ARCH: ${{ inputs.arch }}
+        # Empty for every run except a release. The repository is public, so
+        # is a token linked into a build that is published.
+        FLEET_TOKEN: ${{ inputs.fleet_token }}
+      run: |
+        set -euo pipefail
+        output="$PWD/enterprise-dist/windows-${TARGET_ARCH}"
+        mkdir -p "$output"
+
+        # The daemon reports this version to NetBird. Engineering Fabric
+        # admits only peers whose version carries the +codebuckets stamp.
+        overlay_root="$(cygpath -u '${{ github.workspace }}')"
+        netbird_version="$(python "$overlay_root/scripts/overlay.py" build-version)"
+        echo "Enterprise build version: ${netbird_version}"
+
+        ldflags="-X github.com/netbirdio/netbird/version.version=${netbird_version}"
+        if [ -n "$FLEET_TOKEN" ]; then
+          ldflags="${ldflags} -X github.com/netbirdio/netbird/client/enterprise.policyToken=${FLEET_TOKEN}"
+        fi
+
+        CGO_ENABLED=0 GOOS=windows GOARCH="$TARGET_ARCH" \
+          go build -trimpath -tags 'enterprise,load_wgnt_from_rsrc' \
+            -ldflags "$ldflags" \
+            -o "$output/netbird.exe" ./client
+
+        (
+          cd client/ui
+          wails3 task windows:build "ARCH=${TARGET_ARCH}" 'EXTRA_TAGS=enterprise'
+        )
+        cp client/ui/bin/netbird-ui.exe "$output/netbird-ui.exe"
+        temp_dir="$(cygpath -u '${{ runner.temp }}')"
+        cp "$temp_dir/netbird-source.provenance.json" "$output/provenance.json"
+
+        # The files sit at the root of the archive. Signing looks for the
+        # executables there, and so does anyone who unpacks a release.
+        archive="$PWD/enterprise-dist/netbird-enterprise-windows-${TARGET_ARCH}.zip"
+        (
+          cd "$output"
+          python -m zipfile -c "$archive" netbird.exe netbird-ui.exe provenance.json
+        )
+        python -c 'import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); pathlib.Path(str(p)+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n", encoding="ascii")' "$archive"
+        echo "distribution=$(cygpath -w "$PWD/enterprise-dist")" >> "$GITHUB_OUTPUT"

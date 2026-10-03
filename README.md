@@ -114,12 +114,18 @@ it.
 - `discover-upstream.yml` discovers a newer stable release and opens a draft
   lock-update PR. It never releases.
 - `qualify.yml` reconstructs, verifies, tests, and builds Windows amd64/arm64
-  candidates entirely on Windows runners. There is no Linux or macOS job.
-- `release.yml` rebuilds the candidates, Authenticode-signs them, uploads them
-  to the release bucket, and then switches `latest.json` to the new version.
-  It starts from the Actions tab or by pushing the release tag, for example
+  candidates entirely on Windows runners, then throws them away. There is no
+  Linux or macOS job.
+- `release.yml` builds each architecture again with the fleet token,
+  Authenticode-signs it and uploads it to the release bucket, all inside one
+  job, and then switches `latest.json` to the new version. It starts from the
+  Actions tab or by pushing the release tag, for example
   `v0.80.0-enterprise.0`. It creates no GitHub release. A signing-only test
-  run publishes nothing.
+  run uploads nothing.
+
+Both use `.github/actions/build-windows`. No workflow stores a build as an
+Actions artifact: the repository is public, and the bucket is the only place a
+release exists.
 
 ## Releases and forced updates
 
@@ -144,7 +150,10 @@ reads `latest.json` and is the only authority the client listens to:
   any signed-in user). The daemon reads no manifest of its own.
 
 A release must be newer than the published one; `scripts/overlay.py
-release-manifest` refuses anything else.
+release-preflight` refuses anything else before building, and
+`release-manifest` checks again against the bucket before switching
+`latest.json`. The manifest is built from the archives read back from the
+bucket, each checked against the SHA-256 written when it was signed.
 
 The server side of the contract, including admission and rollout, is described
 in `NETBIRD.md` and `docs/NETBIRD_OPERATIONS.md` in the Engineering Fabric

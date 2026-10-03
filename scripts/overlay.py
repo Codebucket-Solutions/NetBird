@@ -612,6 +612,7 @@ def release_preflight(args: argparse.Namespace, overlay_root: Path) -> None:
     if not STABLE_TAG.fullmatch(upstream_tag):
         raise RuntimeError("locked upstream tag is not stable")
     release_tag = f"{upstream_tag}-enterprise.{args.enterprise_revision}"
+    require_newer_than_published(release_identity(overlay_root)[0], args.published_manifest)
     github_output("release_tag", release_tag)
     github_output("upstream_tag", upstream_tag)
     print_result({"release_tag": release_tag, "upstream_tag": upstream_tag})
@@ -645,29 +646,42 @@ def version_order(version: str) -> tuple[int, int, int, int]:
     return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 
+def require_newer_than_published(version: str, published_manifest: str | None) -> None:
+    """Refuse a release that would not replace the published one.
+
+    Publishing latest.json is what makes every older build stop working, so a
+    version that is not newer than the published one must never be released.
+    """
+    if not published_manifest or not Path(published_manifest).is_file():
+        return
+    published = str(read_json(Path(published_manifest)).get("version", ""))
+    if version_order(version) <= version_order(published):
+        raise RuntimeError(f"release {version} is not newer than the published {published}")
+
+
 def release_manifest(args: argparse.Namespace, overlay_root: Path) -> None:
     """Write latest.json for the signed archives of the current release.
 
-    Clients read this file to learn which build is allowed to connect, so
-    publishing it is what makes every older build stop working. A release that
-    is not newer than the published one is refused.
+    Clients read this file to learn which build is allowed to connect. The
+    archives are the ones read back from the bucket; each must match the
+    .sha256 written when it was signed, so the manifest describes signed bytes.
     """
     config = read_json(overlay_root / "overlay.config.json")
     version, release_tag = release_identity(overlay_root)
     base_url = str(config["release_base_url"]).rstrip("/")
-
-    if args.published_manifest and Path(args.published_manifest).is_file():
-        published = str(read_json(Path(args.published_manifest)).get("version", ""))
-        if version_order(version) <= version_order(published):
-            raise RuntimeError(f"release {version} is not newer than the published {published}")
+    require_newer_than_published(version, args.published_manifest)
 
     artifacts = []
     for archive in sorted(Path(args.artifacts_directory).resolve().glob("netbird-enterprise-*.zip")):
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        signed_digest = archive.with_name(archive.name + ".sha256").read_text(encoding="ascii").split()[0]
+        if digest != signed_digest:
+            raise RuntimeError(f"{archive.name} does not match the checksum written at signing")
         artifacts.append(
             {
                 "platform": archive.stem.removeprefix("netbird-enterprise-"),
                 "url": f"{base_url}/releases/{release_tag}/{archive.name}",
-                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "sha256": digest,
                 "size": archive.stat().st_size,
             }
         )
@@ -725,6 +739,7 @@ def parser() -> argparse.ArgumentParser:
 
     release_parser = commands.add_parser("release-preflight", help="enforce protected release gates")
     release_parser.add_argument("--enterprise-revision", required=True)
+    release_parser.add_argument("--published-manifest", help="the latest.json currently published, if any")
     release_parser.add_argument(
         "--allow-release-disabled",
         action="store_true",

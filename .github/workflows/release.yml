@@ -3,6 +3,10 @@ name: Publish enterprise release
 # A release starts from the Actions tab, or by pushing its tag
 # (for example v0.80.0-enterprise.0). The tag must match the lock and the
 # enterprise revision in overlay.config.json.
+#
+# Each architecture is built, signed and uploaded to the release bucket inside
+# one job. Nothing is stored as a workflow artifact: the bucket is the only
+# place a release exists, and latest.json is switched last.
 on:
   push:
     tags:
@@ -14,7 +18,7 @@ on:
         required: true
         type: string
       signing_test_only:
-        description: Exercise signing without creating a release
+        description: Build and sign without uploading anything
         required: false
         default: false
         type: boolean
@@ -25,6 +29,15 @@ permissions:
 concurrency:
   group: enterprise-release
   cancel-in-progress: false
+
+env:
+  AWS_DEFAULT_REGION: auto
+  AWS_ENDPOINT_URL: https://242336bb32cd0b7be83c597188934f79.r2.cloudflarestorage.com
+  # R2 does not implement the newer default checksum trailers.
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  RELEASE_BUCKET: codebucket-netbird-client
+  PUBLIC_MANIFEST_URL: https://netbird-client.download.codebuckets.in/latest.json
 
 jobs:
   preflight:
@@ -55,8 +68,15 @@ jobs:
           set -euo pipefail
           # A pushed tag ends in the enterprise revision.
           revision="${REQUESTED_REVISION:-${PUSHED_TAG##*.}}"
+          # Refuse a release that is not newer than what clients see before
+          # building anything. The bucket is checked again before publishing.
+          published_arguments=()
+          if curl -fsS --retry 3 --retry-delay 5 -o published-latest.json "$PUBLIC_MANIFEST_URL"; then
+            published_arguments=(--published-manifest published-latest.json)
+          fi
           gate="$(python scripts/overlay.py release-preflight \
             --enterprise-revision "$revision" \
+            "${published_arguments[@]}" \
             ${{ inputs.signing_test_only && '--allow-release-disabled' || '' }})"
           echo "$gate"
           if [ -n "$PUSHED_TAG" ]; then
@@ -67,85 +87,82 @@ jobs:
             fi
           fi
 
-  qualify:
-    name: Rebuild protected candidates
+  build-sign-upload:
+    name: Windows ${{ matrix.arch }} release
     needs: preflight
-    uses: ./.github/workflows/qualify.yml
-    with:
-      require_enterprise_hook: true
-      embed_fleet_token: true
-    secrets:
-      NB_ENTERPRISE_POLICY_TOKEN: ${{ secrets.NB_ENTERPRISE_POLICY_TOKEN }}
-    permissions:
-      contents: read
-
-  sign-windows:
-    name: Authenticode Windows ${{ matrix.arch }}
-    needs:
-      - preflight
-      - qualify
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         arch:
           - amd64
           - arm64
+    env:
+      RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
     steps:
       - name: Check out enterprise overlay
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Build Windows candidate
+        id: build
+        uses: ./.github/actions/build-windows
         with:
-          python-version: '3.13'
-
-      - name: Download qualified Windows candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: candidate-windows-${{ matrix.arch }}
-          path: ${{ runner.temp }}/unsigned
+          arch: ${{ matrix.arch }}
+          run_tests: ${{ matrix.arch == 'amd64' }}
+          fleet_token: ${{ secrets.NB_ENTERPRISE_POLICY_TOKEN }}
 
       - name: Sign and verify Windows executables
         shell: bash
         env:
           CSCA1_CERT: ${{ secrets.CSCA1_CERT }}
           CSCA1_KEY: ${{ secrets.CSCA1_KEY }}
+          DISTRIBUTION: ${{ steps.build.outputs.distribution }}
         run: |
           set -euo pipefail
-          temp_dir="$(cygpath -u '${{ runner.temp }}')"
           python scripts/sign_windows.py \
-            --input-directory "$temp_dir/unsigned" \
-            --output-directory "$temp_dir/signed-${{ matrix.arch }}"
+            --input-directory "$(cygpath -u "$DISTRIBUTION")" \
+            --output-directory signed
 
-      - name: Upload signed Windows candidate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: signed-windows-${{ matrix.arch }}
-          path: ${{ runner.temp }}/signed-${{ matrix.arch }}/*
-          if-no-files-found: error
-          retention-days: 14
+      - name: Refuse to overwrite a published release
+        if: ${{ !inputs.signing_test_only }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          if aws s3api head-object --bucket "$RELEASE_BUCKET" --key "releases/${RELEASE_TAG}/latest.json" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} is already in the bucket and will not be overwritten" >&2
+            exit 1
+          fi
 
-  publish-bucket:
-    name: Publish to the release bucket
+      # The archive is downloadable from here on, but nothing points at it
+      # until latest.json is switched by the publish job.
+      - name: Upload the signed archive
+        if: ${{ !inputs.signing_test_only }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          aws s3 cp signed "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" \
+            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
+
+  publish:
+    name: Switch latest.json
     if: ${{ !inputs.signing_test_only }}
     needs:
       - preflight
-      - sign-windows
+      - build-sign-upload
     runs-on: windows-2022
     timeout-minutes: 15
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      AWS_ENDPOINT_URL: https://242336bb32cd0b7be83c597188934f79.r2.cloudflarestorage.com
-      # R2 does not implement the newer default checksum trailers.
-      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-      RELEASE_BUCKET: codebucket-netbird-client
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
     steps:
       - name: Check out enterprise overlay
@@ -158,12 +175,14 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Download signed Windows candidates
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: signed-windows-*
-          path: release-assets
-          merge-multiple: true
+      # The manifest describes the bytes that are in the bucket, which the
+      # .sha256 files written at signing time prove are the signed ones.
+      - name: Download the uploaded release
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" release-assets \
+            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
 
       - name: Build the release manifest
         shell: bash
@@ -179,24 +198,13 @@ jobs:
             --output latest.json \
             "${published_arguments[@]}"
 
-      - name: Refuse to overwrite a published release
-        shell: bash
-        run: |
-          set -euo pipefail
-          if aws s3api head-object --bucket "$RELEASE_BUCKET" --key "releases/${RELEASE_TAG}/latest.json" >/dev/null 2>&1; then
-            echo "Release ${RELEASE_TAG} is already in the bucket and will not be overwritten" >&2
-            exit 1
-          fi
-
       # latest.json is what clients and Engineering Fabric read. It is switched
       # last, so the release it names is already downloadable. From that moment
       # every older build stops being allowed to connect.
-      - name: Upload the release, then switch latest.json
+      - name: Switch latest.json
         shell: bash
         run: |
           set -euo pipefail
-          aws s3 cp release-assets "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/" \
-            --recursive --exclude '*' --include '*.zip' --include '*.sha256' --no-progress
           aws s3 cp latest.json "s3://${RELEASE_BUCKET}/releases/${RELEASE_TAG}/latest.json" \
             --content-type application/json --no-progress
           aws s3 cp latest.json "s3://${RELEASE_BUCKET}/latest.json" \
@@ -207,7 +215,7 @@ jobs:
         run: |
           set -euo pipefail
           expected="$(python -c 'import json; print(json.load(open("latest.json"))["version"])')"
-          published="$(curl -fsS --retry 5 --retry-delay 5 'https://netbird-client.download.codebuckets.in/latest.json' | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          published="$(curl -fsS --retry 5 --retry-delay 5 "$PUBLIC_MANIFEST_URL" | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
           if [ "$published" != "$expected" ]; then
             echo "The public manifest names ${published}, expected ${expected}" >&2
             exit 1
