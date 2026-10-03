@@ -11,20 +11,25 @@ there); the client side is `custom/client/enterprise`.
 
 ## Decision
 
-Every NetBird user must run the CodeBuckets enterprise client, except users in
-the bypass group who may run the official NetBird client. Two NetBird groups
-define the population, and NetBird's own default-deny access control enforces
-it. Nothing in the management server is patched or replaced.
+Every NetBird user must run the CodeBuckets enterprise client, except members
+of the bypass group who may run the official NetBird client. Who is which is
+decided in Entra; Engineering Fabric mirrors it into NetBird groups, and
+NetBird's own default-deny access control enforces it. Nothing in the
+management server is patched or replaced, and NetBird never sees Entra: the
+self-hosted server has no Graph access, and the JWT groups claim is omitted
+past 200 groups.
 
-| Group | Who belongs | Client allowed | Who maintains it |
+| NetBird group | Peers in it | Client allowed | Who maintains it |
 | --- | --- | --- | --- |
-| `netbird-users` | peers of every person who may use NetBird | enterprise client only | Engineering Fabric, one peer at a time, automatically |
-| `netbird-bypass` | people explicitly allowed to use the official client, plus machines: exit-node gateways, routing peers, servers, CI runners | official or enterprise client | administrators, in the dashboard or through an Entra group claim; setup keys for machines |
+| users | peers of members of the users Entra group that pass admission | enterprise client only | Engineering Fabric admission, one peer at a time |
+| bypass | peers of members of the bypass Entra group | official or enterprise client | Engineering Fabric group sync, from Entra |
+| mirrored groups | peers of members of further Entra groups, limited to peers in the users or bypass group | as above | Engineering Fabric group sync, from Entra |
+| machine groups | exit-node gateways, routing peers, servers, CI runners | official client | administrators, through setup keys; never touched by Engineering Fabric |
 
-A peer in neither group authenticates and appears in the dashboard, but no
+A peer in no sourced group authenticates and appears in the dashboard, but no
 access policy, route, or DNS applies to it, so nothing is reachable.
 
-## How a peer gets into `netbird-users`
+## How a peer gets into the users group
 
 The enterprise client polls Engineering Fabric every 15 seconds. Each poll
 carries the compiled fleet token, the peer's NetBird IP, and the device serial
@@ -34,17 +39,19 @@ API peer record for that IP, and then decides:
 
 ```text
 admitted  = the peer exists in NetBird (looked up by NetBird IP)
+        and the peer's NetBird user can be resolved
+        and that user is a member of the users Entra group
         and the enterprise client polled within the last 5 minutes
         and the polled serial equals the serial NetBird recorded for that peer
-        and the peer's NetBird user can be resolved
         and the version the client reported to NetBird carries the enterprise stamp (+codebuckets.)
         and no other currently polling peer of the same user reports the same serial
         and Intune reports the device compliant for that user, matched by serial, with the same OS
 ```
 
-Admitted peers are written to `netbird-users` through the NetBird API. A peer
-leaves the group when polling stops for five minutes, when Intune reports it
-non-compliant, or when it disappears from NetBird. Unknown is never treated as
+Admitted peers are written to the users group through the NetBird API. A peer
+leaves the group when its user leaves the Entra group, when polling stops for
+five minutes, when Intune reports it non-compliant, or when it disappears from
+NetBird. Unknown is never treated as
 non-compliant: if Intune or the NetBird API is unreachable, memberships stay
 as they are and an alert fires.
 
@@ -53,9 +60,10 @@ Every peer in the Engineering Fabric device list carries one admission reason:
 | Reason | Meaning |
 | --- | --- |
 | `ADMITTED` | every condition above holds |
-| `BYPASS_GROUP` | the peer's access comes from `netbird-bypass` |
+| `BYPASS_GROUP` | the peer's access comes from the bypass group |
 | `NOT_POLLING` | no poll from the enterprise client within the last five minutes |
 | `USER_UNRESOLVED` | the peer's NetBird user could not be resolved |
+| `NOT_IN_USERS_GROUP` | the peer's user is not a member of the users Entra group |
 | `VERSION_NOT_ENTERPRISE` | the version NetBird recorded lacks the `+codebuckets.` stamp |
 | `UNIDENTIFIABLE_SERIAL` | the serial is blank or unusable as a device identifier |
 | `DUPLICATE_SERIAL` | another currently polling peer of the same user reports the same serial |
@@ -79,14 +87,16 @@ client plus firmware spoofing.
 
 ## One-time setup
 
-1. Create the groups `netbird-users` and `netbird-bypass` in the dashboard.
-   Nothing else may ever add peers to `netbird-users`: no user auto-group, no
-   JWT claim, no setup key.
+1. Create the users and bypass Entra groups (the platform's mapped access
+   rights are a convenient way) and the users and bypass NetBird groups in the
+   dashboard, plus a NetBird group for every further Entra group to mirror.
+   Nothing else may ever add peers to a group Engineering Fabric writes: no
+   user auto-group, no JWT claim, no setup key. The sync replaces the whole
+   peer list, so anything added by hand is removed on the next run.
 2. Keep user group propagation enabled (Settings, Groups). It is on by default
    for new accounts.
-3. `netbird-bypass` people are managed in the dashboard as auto-assigned groups.
-   Do not map an Entra claim to it: NetBird's JWT sync manages only groups it
-   created itself, so a dashboard group and a claim would fight.
+3. Create a separate NetBird group for machines and never let Engineering
+   Fabric manage it.
 4. Make sure the Entra application registration NetBird uses emits the `email`
    claim in ID tokens; NetBird's user emails come from it. The client itself
    never sends an email. For a new NetBird account set `AuthUserIDClaim` to `oid`; for
@@ -97,27 +107,29 @@ client plus firmware spoofing.
    Access Control for the existing account; set `DisableDefaultPolicy` for
    accounts created later.
 6. Source every access policy, route distribution group, and nameserver group
-   from `netbird-users`, `netbird-bypass`, or narrower groups. Never use `All`.
-   Engineering Fabric audits this and alerts.
-7. Create machine setup keys with the auto-assigned group `netbird-bypass`,
-   one-off or with a usage limit and a short expiry. Treat them as admission
-   credentials and never bake them into images.
+   from the users group, the bypass group, mirrored groups, or machine groups.
+   Never use `All`. Engineering Fabric audits this and alerts.
+7. Create machine setup keys with the auto-assigned machine group, one-off or
+   with a usage limit and a short expiry. Treat them as admission credentials
+   and never bake them into images.
 8. Create a NetBird service user with a personal access token for Engineering
    Fabric, and grant Engineering Fabric's Entra application permission to read
-   Intune managed devices. Note the two group IDs; Engineering Fabric is
-   configured by group ID because NetBird allows duplicate group names.
-9. Run the Engineering Fabric reconciler read-only once, review its device
-   list, then enable writes.
+   Intune managed devices and transitive group members. Configure Engineering
+   Fabric with the Entra object IDs and the NetBird group IDs (NetBird allows
+   duplicate group names, so IDs are what count).
+9. Run the Engineering Fabric admission and group sync read-only once, review
+   the device list and the per-group counts, then enable writes.
 
 ## Day-to-day operations
 
 | Task | Action | Effect |
 | --- | --- | --- |
 | onboard a normal user | install the enterprise client; the user signs in | the peer is admitted within about a minute of the first poll (one reconcile interval plus the Intune lookup), once Intune shows the device compliant |
-| allow a person to use the official client | add the user to `netbird-bypass` | every existing and future device of that user is admitted immediately |
-| temporary bypass | add to `netbird-bypass`, set a reminder, remove later | both changes are recorded as NetBird activity events |
-| end a bypass | remove the user from `netbird-bypass` | the user's official-client peers lose access at once; enterprise-client peers stay admitted through `netbird-users` |
-| enroll a gateway or server | register with a `netbird-bypass` setup key | admitted for as long as the membership exists |
+| allow a person to use the official client | add the user to the bypass Entra group | every existing and future device of that user is in the NetBird bypass group within a sync interval |
+| temporary bypass | add to the bypass Entra group, set a reminder, remove later | both changes are recorded in Entra and as NetBird activity events |
+| end a bypass | remove the user from the bypass Entra group | the user's official-client peers lose access on the next sync; enterprise-client peers stay admitted through the users group |
+| give a team access to something | source the NetBird policy from a group mirrored from the team's Entra group | membership follows Entra within a sync interval |
+| enroll a gateway or server | register with a machine-group setup key | admitted for as long as the membership exists |
 | offboard a user | delete the user in NetBird or disable them in Entra | their peers stop being admitted; normal offboarding removes them |
 | see why a device has no access | Engineering Fabric device list | shows peer, user, serial, compliance, last poll, and the admission reason |
 | a laptop wakes after sleeping longer than five minutes | nothing to do | it was removed while asleep and is readmitted within about a minute of its first poll after waking |
@@ -196,7 +208,7 @@ HTTP 200 with a policy:
 | Situation | Behavior |
 | --- | --- |
 | official client on a personal device | registers, gets nothing, visible as not admitted |
-| official client installed over the enterprise client on a corporate device | polling stops; removed from `netbird-users` after five minutes; a script that keeps polling still fails the version check |
+| official client installed over the enterprise client on a corporate device | polling stops; removed from the users group after five minutes; a script that keeps polling still fails the version check |
 | device non-compliant in Intune | removed on the next reconcile; readmitted automatically when compliant |
 | blank or placeholder serial number | a blank serial cannot poll and stays `NOT_POLLING`; a placeholder such as `To be filled by O.E.M.` is listed as `UNIDENTIFIABLE_SERIAL`; either needs a real serial or a bypass entry |
 | same serial on two polling peers of one user | listed as `DUPLICATE_SERIAL`; a re-enrolled device recovers on its own once its old peer stops polling |
@@ -211,12 +223,12 @@ HTTP 200 with a policy:
 | Symptom | Check | Fix |
 | --- | --- | --- |
 | connected but nothing reachable, corporate device | Engineering Fabric device list: last poll and compliance | not polling means the enterprise client is not running; non-compliant means fix the device in Intune |
-| connected but nothing reachable, personal device | device list shows no Intune match | expected; add the user to `netbird-bypass` only if that is intended |
-| device listed as unidentifiable | serial number blank | give the machine a real serial or use a bypass setup key |
+| connected but nothing reachable, personal device | device list shows no Intune match | expected; add the user to the bypass Entra group only if that is intended |
+| device listed as unidentifiable | serial number blank | give the machine a real serial, or add its user to the bypass Entra group |
 | device listed with a duplicate serial | another polling peer of the same user reports the same serial, usually the old registration of a re-enrolled device | nothing to do once the old peer stops polling; delete the old peer in NetBird to speed it up |
 | a whole group of peers lost access at once | policies for `All` usage, Fabric audit alert, group membership | restore the policy sources; Fabric never removes peers when its inputs are unreachable |
 | a device is stuck strict after a fresh install | the peer has no NetBird IP yet so the client does not poll, or the poll is answered 403 because the IP is unknown or the serial differs from the one NetBird recorded | sign in first; then compare the device serial with the peer's serial in NetBird |
-| gateway or server has no access | its group membership | its setup key lacked `netbird-bypass`, or the membership was removed |
+| gateway or server has no access | its group membership | its setup key lacked the machine group, or it was put in a group Engineering Fabric writes and the sync removed it |
 
 ## Optional hardening kept on file
 
