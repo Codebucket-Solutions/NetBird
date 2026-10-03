@@ -40,12 +40,11 @@ Qualification checks the Go enforcement registry against the upstream MDM
 constants, so an upstream rename cannot go unnoticed.
 
 Peer admission is implemented in Engineering Fabric and is switched off there
-until rollout. Two Entra groups define the population, each mirrored into a
-NetBird group by Engineering Fabric: the users group, whose peers are admitted
-from this client's polls and Intune compliance, and the bypass group, whose
-members may run the official client. Further Entra groups can be mirrored for
-finer access. NetBird default-deny policies sourced from those NetBird groups
-enforce it; no management-server code changes. The client identifies itself by its NetBird
+until rollout. Engineering Fabric keeps NetBird groups equal to Entra groups,
+and a group marked admitted-only holds only devices that pass admission: this
+client polling, an enterprise build, and Intune compliance. NetBird
+default-deny policies built on those groups enforce it; no management-server
+code changes. The client identifies itself by its NetBird
 IP and serial number only, never by WireGuard keys; Engineering Fabric derives
 the user, hostname, OS, and client version from the NetBird management API peer
 record. See [`docs/peer-admission.md`](docs/peer-admission.md).
