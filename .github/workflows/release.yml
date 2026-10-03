@@ -169,27 +169,10 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          source="$(cygpath -u '${{ runner.temp }}')/netbird-source"
-          version="$(python scripts/overlay.py build-version)"
-          upstream="${version%%+*}"
-          revision="${version##*.}"
-          mkdir -p release
-
-          # NSIS wants a four-part file version; the enterprise revision is the fourth.
-          (cd "$source" && APPVER="${upstream}.${revision}" \
-            "/c/Program Files (x86)/NSIS/makensis.exe" /V4 "/DARCH=${ARCH}" client/installer.nsis)
-          mv "$source/netbird-installer.exe" "release/netbird-enterprise-windows-${ARCH}.exe"
-
-          # The MSI carries the upstream version; same-version upgrades are allowed, so a
-          # new enterprise revision of the same upstream still installs over the previous one.
-          dotnet tool install --global wix --version 6.0.2 >/dev/null
-          wix extension add WixToolset.Util.wixext/6.0.2 >/dev/null
-          wix_arch=x64
-          if [ "$ARCH" = arm64 ]; then wix_arch=arm64; fi
-          (cd "$source" && NETBIRD_VERSION="$upstream" wix build -arch "$wix_arch" -ext WixToolset.Util.wixext \
-            -o "$(cygpath -w "$PWD/release/netbird-enterprise-windows-${ARCH}.msi")" ./client/netbird.wxs \
-            -d "ProcessorArchitecture=${wix_arch}" -d "ArchSuffix=${ARCH}")
-          ls -l release
+          python scripts/build_installers.py \
+            --source "$(cygpath -u '${{ runner.temp }}')/netbird-source" \
+            --arch "$ARCH" \
+            --output release
 
       - name: Sign and verify the installers
         shell: bash
