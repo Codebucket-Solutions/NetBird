@@ -28,6 +28,72 @@ index e9a0e055f177ab85b05d9578407df95c65f3b17a..f0a94db3618e33dc875fe7d890c948ef
  	p.serverInstanceMu.Unlock()
  
  	if jsonListener == nil {
+diff --git a/client/ui/services/theme.go b/client/ui/services/theme.go
+index 52215e34bcfea60f011bebbf6de327d842ae3d76..d81a8188aa194d002e3e5561da2a2a10b1cea208 100644
+--- a/client/ui/services/theme.go
++++ b/client/ui/services/theme.go
+@@ -34,14 +34,23 @@ type Theme struct {
+ 	// started gates the main-thread dispatch in apply: Run installs the platform
+ 	// layer InvokeAsync needs, and the store subscription can fire before that.
+ 	started atomic.Bool
++	// ready holds the windows whose webview has loaded. A window still being
++	// created is already listed by Window.GetAll, and apply's main-thread work
++	// can be dispatched from inside that creation's own message pump, before
++	// the WebView2 controller exists; tinting it then dereferences nil and
++	// takes the process down. Such a window reads the appearance globals at
++	// creation and is tinted on the next theme change after it is ready.
++	readyMu sync.Mutex
++	ready   map[uint]struct{}
+ }
+ 
+ // NewTheme wires the store subscription and OS theme-change listener. Call
+ // before any window is created so creation-time colours are already themed.
+ func NewTheme(app *application.App, store *preferences.Store) *Theme {
+-	t := &Theme{app: app, store: store}
++	t := &Theme{app: app, store: store, ready: make(map[uint]struct{})}
+ 	pref := store.Get().Theme
+ 	setAppearance(pref, resolveDark(pref, app.Env.IsDarkMode()))
++	app.Window.OnCreate(t.trackWindow)
+ 
+ 	// Window creation resolves through this rather than the seed above, which
+ 	// is wrong until Run installs the platform layer: Env.IsDarkMode reports
+@@ -184,7 +193,7 @@ func (t *Theme) apply() {
+ 		// open because later windows inherit it instead of carrying it.
+ 		setAppAppearance(dark)
+ 		for _, w := range t.app.Window.GetAll() {
+-			if w == nil {
++			if w == nil || !t.isReady(w.ID()) {
+ 				continue
+ 			}
+ 			w.SetBackgroundColour(colour)
+@@ -192,3 +201,27 @@ func (t *Theme) apply() {
+ 		}
+ 	})
+ }
++
++// trackWindow records when a window's webview has loaded and forgets the
++// window once it closes. OnCreate fires before the window is run, so the
++// runtime-ready event is never missed.
++func (t *Theme) trackWindow(w application.Window) {
++	id := w.ID()
++	w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) {
++		t.readyMu.Lock()
++		t.ready[id] = struct{}{}
++		t.readyMu.Unlock()
++	})
++	w.OnWindowEvent(events.Common.WindowClosing, func(*application.WindowEvent) {
++		t.readyMu.Lock()
++		delete(t.ready, id)
++		t.readyMu.Unlock()
++	})
++}
++
++func (t *Theme) isReady(id uint) bool {
++	t.readyMu.Lock()
++	defer t.readyMu.Unlock()
++	_, ok := t.ready[id]
++	return ok
++}
 diff --git a/client/ui/tray.go b/client/ui/tray.go
 index c392a0b62ee7371402c8b26fc60ce455eda900da..f76e86e16f6eb5f6f93d1c4faadb372626a05cd9 100644
 --- a/client/ui/tray.go

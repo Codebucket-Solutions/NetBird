@@ -42,7 +42,7 @@ const (
 
 // enterpriseRevision is not sent on the wire. scripts/overlay.py checks it
 // against overlay.config.json so the source and the release revision agree.
-const enterpriseRevision = "codebuckets.1"
+const enterpriseRevision = "codebuckets.2"
 
 // LifecycleServer is the narrow seam between NetBird and the enterprise
 // decorator. The raw server remains available to the OS service shutdown path.

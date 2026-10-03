@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product_name": "CodeBuckets NetBird Enterprise",
-  "enterprise_revision": 1,
+  "enterprise_revision": 2,
   "release_enabled": true,
   "require_enterprise_hook": true,
   "allow_ui_patch": false,
@@ -14,6 +14,7 @@
     "client/cmd/service_controller.go",
     "client/ui/enterprise_*.go",
     "client/ui/services/enterprise_*.go",
+    "client/ui/services/theme.go",
     "client/ui/tray.go"
   ]
 }

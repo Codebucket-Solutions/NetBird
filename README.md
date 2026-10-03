@@ -18,12 +18,15 @@ checkout from the lock and applies the patch.
 ## Current implementation status
 
 The overlay carries exactly one patch,
-`patches/0001-enterprise-enforce-managed-client-policy.patch`. It makes two
-deliberately tiny changes to upstream: the daemon composition hook in
-`client/cmd/service_controller.go`, and one guard call at the start of the
-desktop tray's Quit handler. All policy, enforcement, polling, and UI guard
-logic is maintained as ordinary Go source under `custom/client`, outside the
-patch.
+`patches/0001-enterprise-enforce-managed-client-policy.patch`. It makes three
+deliberately small changes to upstream: the daemon composition hook in
+`client/cmd/service_controller.go`, one guard call at the start of the
+desktop tray's Quit handler, and a fix in `client/ui/services/theme.go` so a
+theme change tints only windows whose webview has loaded (upstream v0.80.0
+tints a window still being created, which dereferences the missing WebView2
+controller and exits the UI; this is a startup race on Windows). All policy,
+enforcement, polling, and UI guard logic is maintained as ordinary Go source
+under `custom/client`, outside the patch.
 
 The wire contract is owned by Engineering Fabric (`docs/API_REFERENCE.md` and
 `NETBIRD.md` there); the client side of it is `custom/client/enterprise`.

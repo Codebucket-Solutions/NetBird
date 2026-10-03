@@ -27,6 +27,7 @@ PATCH_DIFF = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
 ENTERPRISE_HOOK_PATCH = "0001-enterprise-enforce-managed-client-policy.patch"
 ENTERPRISE_HOOK_PATHS = {
     "client/cmd/service_controller.go",
+    "client/ui/services/theme.go",
     "client/ui/tray.go",
 }
 CUSTOM_SOURCE_PATTERNS = (
