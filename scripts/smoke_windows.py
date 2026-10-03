@@ -52,7 +52,8 @@ def wait_for_daemon(netbird: Path) -> str:
     while time.time() < deadline:
         completed = run([str(netbird), "status"], timeout=30, check=False)
         last = completed.stdout + completed.stderr
-        if completed.returncode == 0 and "Daemon version" in completed.stdout:
+        # A fresh install reports "Daemon status: NeedsLogin"; a logged-in one reports its version.
+        if completed.returncode == 0 and ("Daemon status" in completed.stdout or "Daemon version" in completed.stdout):
             return completed.stdout
         time.sleep(3)
     raise RuntimeError("the daemon did not answer 'status' in time:\n" + last + "\n--- client.log ---\n" + tail(DAEMON_LOG))
