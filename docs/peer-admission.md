@@ -23,7 +23,7 @@ past 200 groups.
 | --- | --- | --- | --- |
 | users | peers of members of the users Entra group that pass admission | enterprise client only | Engineering Fabric admission, one peer at a time |
 | bypass | peers of members of the bypass Entra group | official or enterprise client | Engineering Fabric group sync, from Entra |
-| mirrored groups | peers of members of further Entra groups, limited to peers in the users or bypass group | as above | Engineering Fabric group sync, from Entra |
+| mirrored groups | peers of members of further Entra groups, for example a group with its own network and DNS rules | as above | Engineering Fabric group sync, from Entra |
 | machine groups | exit-node gateways, routing peers, servers, CI runners | official client | administrators, through setup keys; never touched by Engineering Fabric |
 
 A peer in no sourced group authenticates and appears in the dashboard, but no
