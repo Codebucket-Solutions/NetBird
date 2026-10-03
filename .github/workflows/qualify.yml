@@ -45,6 +45,19 @@ jobs:
       # The runner is amd64, so only that build can be started. The daemon runs
       # as a service and the UI is kept running for a while; the enterprise
       # hook polls the policy server and is expected to be refused here.
+      # A console-subsystem build without the production tag: the Wails
+      # runtime then reports on stderr what the shipped build discards.
+      - name: Build a diagnostic UI
+        if: matrix.arch == 'amd64'
+        shell: bash
+        env:
+          DISTRIBUTION: ${{ steps.build.outputs.distribution }}
+        run: |
+          set -euo pipefail
+          source="$(cygpath -u '${{ runner.temp }}')/netbird-source"
+          (cd "$source/client/ui" && wails3 task windows:build:console ARCH=amd64 DEV=true EXTRA_TAGS=enterprise)
+          cp "$source/client/ui/bin/netbird-ui-console.exe" "$(cygpath -u "$DISTRIBUTION")/windows-amd64/"
+
       - name: Smoke test the build
         if: matrix.arch == 'amd64'
         shell: bash
@@ -54,4 +67,5 @@ jobs:
           set -euo pipefail
           python scripts/smoke_windows.py \
             --expected-version "$(python scripts/overlay.py build-version)" \
-            --directory "$(cygpath -u "$DISTRIBUTION")/windows-amd64"
+            --directory "$(cygpath -u "$DISTRIBUTION")/windows-amd64" \
+            --diagnostic-ui "$(cygpath -u "$DISTRIBUTION")/windows-amd64/netbird-ui-console.exe"

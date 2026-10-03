@@ -125,14 +125,37 @@ def check_ui(ui: Path) -> None:
     print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s in every launch variant and set up its tray icon")
 
 
-def smoke(directory: Path, expected: str) -> None:
+def run_diagnostic_ui(ui: Path) -> None:
+    """Run a console-subsystem, non-production build with its output captured and report it."""
+    console = Path(tempfile.gettempdir()) / "netbird-ui-diagnostic.console"
+    if console.exists():
+        console.unlink()
+    print(f"+ {ui} --log-level debug  (diagnostic build, output captured)", flush=True)
+    with console.open("wb") as handle:
+        process = subprocess.Popen([str(ui), "--log-level", "debug"], stdout=handle, stderr=subprocess.STDOUT)
+        time.sleep(UI_GRACE_SECONDS)
+        exited = process.poll()
+    if exited is None:
+        process.kill()
+        process.wait(timeout=30)
+    output = tail(console, 60)
+    state = "still running" if exited is None else f"exited with {exited}"
+    print(f"diagnostic build: {state}\n{output}", flush=True)
+    notice("Diagnostic UI output", f"{state}\n{output}")
+
+
+def smoke(directory: Path, expected: str, diagnostic_ui: Path | None) -> None:
     netbird, ui = directory / "netbird.exe", directory / "netbird-ui.exe"
     for executable in (netbird, ui):
         if not executable.is_file():
             raise RuntimeError(f"{executable} is missing")
     check_version(netbird, expected)
     print(wait_for_daemon(netbird))
-    check_ui(ui)
+    try:
+        check_ui(ui)
+    finally:
+        if diagnostic_ui and diagnostic_ui.is_file():
+            run_diagnostic_ui(diagnostic_ui)
 
 
 def main() -> int:
@@ -141,6 +164,7 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--directory", help="run the daemon from these built files")
     source.add_argument("--installer", help="install this NSIS installer silently and test the installation")
+    parser.add_argument("--diagnostic-ui", help="a console-subsystem UI build to run with its output captured after the checks")
     args = parser.parse_args()
     if os.name != "nt":
         raise SystemExit("the smoke test runs on Windows only")
@@ -155,7 +179,7 @@ def main() -> int:
         else:
             run([str(netbird), "service", "install"], timeout=120)
             run([str(netbird), "service", "start"], timeout=120)
-        smoke(directory, args.expected_version)
+        smoke(directory, args.expected_version, Path(args.diagnostic_ui) if args.diagnostic_ui else None)
     except Exception as error:  # noqa: BLE001 - every failure is reported the same way
         annotate("Windows smoke test failed", str(error))
         return 1
