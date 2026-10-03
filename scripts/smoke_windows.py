@@ -79,6 +79,8 @@ def check_ui(ui: Path) -> None:
     """
     log = Path(tempfile.gettempdir()) / "netbird-ui-smoke.log"
     console = Path(tempfile.gettempdir()) / "netbird-ui-smoke.console"
+    # Where the enterprise UI sends stderr when it has no standard handles (enterprise_stderr_windows.go).
+    stderr_log = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "netbird" / "netbird-ui.stderr.log"
     command = [str(ui), "--log-file", str(log), "--log-level", "debug"]
     detached = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     report = []
@@ -88,7 +90,7 @@ def check_ui(ui: Path) -> None:
         ("detached, output to a file", {"creationflags": detached, "close_fds": True, "capture": True}),
         ("inherited handles", {}),
     ):
-        for path in (log, console):
+        for path in (log, console, stderr_log):
             if path.exists():
                 path.unlink()
         capture = kwargs.pop("capture", False)
@@ -107,6 +109,8 @@ def check_ui(ui: Path) -> None:
         output = "--- ui log ---\n" + tail(log, 40)
         if capture:
             output += "\n--- ui console ---\n" + tail(console, 40)
+        else:
+            output += "\n--- ui stderr log ---\n" + tail(stderr_log, 40)
         state = "still running" if exited is None else f"exited with {exited}"
         print(f"{name}: {state}\n{output}", flush=True)
         report.append(f"{name}: {state}")
@@ -115,7 +119,7 @@ def check_ui(ui: Path) -> None:
         elif "tray applyIcon" not in output:
             failures.append(f"{name}: running but never set up its tray icon\n{output}")
         time.sleep(3)
-    notice("UI launch variants", "\n".join(report) + "\n--- ui console (detached, file) ---\n" + tail(console, 40))
+    notice("UI launch variants", "\n".join(report) + "\n--- ui stderr log (last variant) ---\n" + tail(stderr_log, 40))
     if failures:
         raise RuntimeError("netbird-ui.exe did not stay up for every launch variant\n" + "\n\n".join(failures))
     print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s in every launch variant and set up its tray icon")
