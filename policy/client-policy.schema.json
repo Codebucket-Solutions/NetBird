@@ -1,6 +1,5 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/Codebucket-Solutions/NetBird/main/policy/client-policy.schema.json",
   "title": "CodeBuckets NetBird client policy response",
   "description": "HTTP 200 body of POST /api/v1/netbird/client/policy on the policy origin in overlay.config.json. The request body is $defs.policyRequest. HTTP 426 carries $defs.updateRequired: the build is older than the latest release and must be replaced. Any other status carries {\"error\":\"CODE\"}; the client reads only the status code. Forward compatibility: clients ignore unknown top-level fields and unknown control keys, and apply their strict default to a known control that is absent, so the server can add fields and controls without breaking deployed clients.",
   "type": "object",
