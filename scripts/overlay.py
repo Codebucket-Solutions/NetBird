@@ -597,8 +597,8 @@ def export_overlay(args: argparse.Namespace, overlay_root: Path) -> None:
 
 
 def release_preflight(args: argparse.Namespace, overlay_root: Path) -> None:
-    if not re.fullmatch(r"[1-9][0-9]*", args.enterprise_revision):
-        raise RuntimeError("enterprise revision must be a positive integer")
+    if not re.fullmatch(r"0|[1-9][0-9]*", args.enterprise_revision):
+        raise RuntimeError("enterprise revision must be a whole number")
     config = read_json(overlay_root / "overlay.config.json")
     lock = read_json(overlay_root / "upstream.lock.json")
     require_schema(lock, config)
@@ -621,7 +621,7 @@ def release_identity(overlay_root: Path) -> tuple[str, str]:
     """Return the version an enterprise build reports and the tag it is released under.
 
     The version is the upstream version followed by the enterprise revision, for
-    example 0.80.0+codebuckets.6, released as v0.80.0-enterprise.6. Engineering
+    example 0.80.0+codebuckets.0, released as v0.80.0-enterprise.0. Engineering
     Fabric admits only peers whose version carries the "+codebuckets." stamp.
     """
     config = read_json(overlay_root / "overlay.config.json")

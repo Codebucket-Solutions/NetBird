@@ -1,7 +1,7 @@
 name: Publish enterprise release
 
 # A release starts from the Actions tab, or by pushing its tag
-# (for example v0.80.0-enterprise.6). The tag must match the lock and the
+# (for example v0.80.0-enterprise.0). The tag must match the lock and the
 # enterprise revision in overlay.config.json.
 on:
   push:

@@ -60,7 +60,7 @@ notification; a peer that stops polling loses admission after five minutes.
 Two values are set when the daemon is linked, not in source:
 
 - **Version.** `python scripts/overlay.py build-version` prints the version the
-  daemon reports, for example `0.78.0+codebuckets.6`: the locked upstream
+  daemon reports, for example `0.80.0+codebuckets.0`: the locked upstream
   version followed by the enterprise revision. CI passes it with
   `-X github.com/netbirdio/netbird/version.version=...`. Engineering Fabric
   admits only peers whose version carries the `+codebuckets.` stamp.
@@ -118,7 +118,7 @@ it.
 - `release.yml` rebuilds the candidates, Authenticode-signs them, uploads them
   to the release bucket, and then switches `latest.json` to the new version.
   It starts from the Actions tab or by pushing the release tag, for example
-  `v0.80.0-enterprise.6`. It creates no GitHub release. A signing-only test
+  `v0.80.0-enterprise.0`. It creates no GitHub release. A signing-only test
   run publishes nothing.
 
 ## Releases and forced updates
