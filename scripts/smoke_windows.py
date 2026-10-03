@@ -66,19 +66,24 @@ def check_version(netbird: Path, expected: str) -> None:
 
 def check_ui(ui: Path) -> None:
     log = Path(tempfile.gettempdir()) / "netbird-ui-smoke.log"
-    if log.exists():
-        log.unlink()
+    console = Path(tempfile.gettempdir()) / "netbird-ui-smoke.console"
+    for path in (log, console):
+        if path.exists():
+            path.unlink()
     print(f"+ {ui} --log-file {log} --log-level debug", flush=True)
-    process = subprocess.Popen([str(ui), "--log-file", str(log), "--log-level", "debug"])
-    time.sleep(UI_GRACE_SECONDS)
-    exited = process.poll()
-    output = tail(log, 80)
+    # A GUI-subsystem process still writes to handles its parent hands it, which is where the Wails
+    # runtime reports a fatal error; logrus output goes to the log file.
+    with console.open("wb") as handle:
+        process = subprocess.Popen([str(ui), "--log-file", str(log), "--log-level", "debug"], stdout=handle, stderr=subprocess.STDOUT)
+        time.sleep(UI_GRACE_SECONDS)
+        exited = process.poll()
+    output = "--- ui log ---\n" + tail(log, 60) + "\n--- ui console ---\n" + tail(console, 40)
     print(output, flush=True)
     if exited is not None:
-        raise RuntimeError(f"netbird-ui.exe exited with {exited} within {UI_GRACE_SECONDS}s\n--- ui log ---\n{output}")
+        raise RuntimeError(f"netbird-ui.exe exited with {exited} within {UI_GRACE_SECONDS}s\n{output}")
     if "tray applyIcon" not in output:
         process.kill()
-        raise RuntimeError("netbird-ui.exe is running but never set up its tray icon\n--- ui log ---\n" + output)
+        raise RuntimeError("netbird-ui.exe is running but never set up its tray icon\n" + output)
     process.kill()
     process.wait(timeout=30)
     print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s and set up its tray icon")
