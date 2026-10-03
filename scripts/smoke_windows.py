@@ -64,29 +64,57 @@ def check_version(netbird: Path, expected: str) -> None:
         raise RuntimeError(f"netbird.exe version is {reported!r}, expected {expected!r}")
 
 
+def notice(title: str, message: str) -> None:
+    print(f"::notice title={title}::{message.strip().replace(chr(13), '')[-1500:].replace(chr(10), '%0A')}", flush=True)
+
+
 def check_ui(ui: Path) -> None:
+    """Start the UI twice: the way Explorer does, and with its output captured.
+
+    A windowsgui binary launched by a double-click or the installer gets no
+    console and no standard handles; that launch is the one users see. The
+    captured launch is for diagnosis: the Wails runtime reports a fatal error
+    on stderr, not through the log file.
+    """
     log = Path(tempfile.gettempdir()) / "netbird-ui-smoke.log"
     console = Path(tempfile.gettempdir()) / "netbird-ui-smoke.console"
     for path in (log, console):
         if path.exists():
             path.unlink()
-    print(f"+ {ui} --log-file {log} --log-level debug", flush=True)
-    # A GUI-subsystem process still writes to handles its parent hands it, which is where the Wails
-    # runtime reports a fatal error; logrus output goes to the log file.
+    command = [str(ui), "--log-file", str(log), "--log-level", "debug"]
+
+    print(f"+ {' '.join(command)}  (detached, no standard handles)", flush=True)
+    detached = subprocess.Popen(command, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)
+    time.sleep(UI_GRACE_SECONDS)
+    detached_exit = detached.poll()
+    detached_log = tail(log, 60)
+    if detached_exit is None:
+        detached.kill()
+        detached.wait(timeout=30)
+    print(f"detached launch: {'still running' if detached_exit is None else f'exited with {detached_exit}'}\n{detached_log}", flush=True)
+    time.sleep(3)
+
+    print(f"+ {' '.join(command)}  (output captured)", flush=True)
     with console.open("wb") as handle:
-        process = subprocess.Popen([str(ui), "--log-file", str(log), "--log-level", "debug"], stdout=handle, stderr=subprocess.STDOUT)
+        captured = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
         time.sleep(UI_GRACE_SECONDS)
-        exited = process.poll()
-    output = "--- ui log ---\n" + tail(log, 60) + "\n--- ui console ---\n" + tail(console, 40)
-    print(output, flush=True)
-    if exited is not None:
-        raise RuntimeError(f"netbird-ui.exe exited with {exited} within {UI_GRACE_SECONDS}s\n{output}")
-    if "tray applyIcon" not in output:
-        process.kill()
-        raise RuntimeError("netbird-ui.exe is running but never set up its tray icon\n" + output)
-    process.kill()
-    process.wait(timeout=30)
-    print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s and set up its tray icon")
+        captured_exit = captured.poll()
+    captured_output = "--- ui log ---\n" + tail(log, 60) + "\n--- ui console ---\n" + tail(console, 40)
+    if captured_exit is None:
+        captured.kill()
+        captured.wait(timeout=30)
+    print(f"captured launch: {'still running' if captured_exit is None else f'exited with {captured_exit}'}\n{captured_output}", flush=True)
+    notice("UI console output", f"detached launch: {'running' if detached_exit is None else f'exit {detached_exit}'}; "
+           f"captured launch: {'running' if captured_exit is None else f'exit {captured_exit}'}\n{captured_output}")
+
+    if detached_exit is not None:
+        raise RuntimeError(f"netbird-ui.exe exited with {detached_exit} within {UI_GRACE_SECONDS}s when launched without standard handles\n"
+                           f"--- ui log (detached) ---\n{detached_log}\n{captured_output}")
+    if captured_exit is not None:
+        raise RuntimeError(f"netbird-ui.exe exited with {captured_exit} within {UI_GRACE_SECONDS}s\n{captured_output}")
+    if "tray applyIcon" not in detached_log:
+        raise RuntimeError("netbird-ui.exe is running but never set up its tray icon\n" + detached_log)
+    print(f"netbird-ui.exe ran for {UI_GRACE_SECONDS}s both ways and set up its tray icon")
 
 
 def smoke(directory: Path, expected: str) -> None:
