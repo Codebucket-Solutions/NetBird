@@ -2,12 +2,12 @@
   "schema_version": 1,
   "repository": "netbirdio/netbird",
   "clone_url": "https://github.com/netbirdio/netbird.git",
-  "release_tag": "v0.80.0",
-  "tag_object_sha": "dbd5923a0acfc3110f2174225c9fede2e7e3a2bb",
-  "commit_sha": "fca64287cf51a85552a41b022013abbfdb335452",
+  "release_tag": "v0.82.0",
+  "tag_object_sha": "14a45446c7ea86827ab1d324e71cd37d85a4431f",
+  "commit_sha": "3c00a97878e6af537d28c3bdd4f42cb4286aa883",
   "commit_verified": true,
   "commit_verification_reason": "valid",
-  "release_url": "https://github.com/netbirdio/netbird/releases/tag/v0.80.0",
-  "release_published_at": "2026-10-01T16:08:09Z",
-  "locked_at": "2026-10-02T03:35:37Z"
+  "release_url": "https://github.com/netbirdio/netbird/releases/tag/v0.82.0",
+  "release_published_at": "2026-10-29T13:56:14Z",
+  "locked_at": "2026-10-31T03:22:14Z"
 }
